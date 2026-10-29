@@ -1,0 +1,36 @@
+
+[project]
+name = "household-intelligence"
+version = "0.1.0"
+description = "Household inventory and demand intelligence system"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi==0.143.3",
+    "uvicorn[standard]==0.54.0",
+    "sqlalchemy==2.1.5",
+    "alembic==1.20.0",
+    "pydantic-settings==2.16.0",
+    "email-validator==2.3.0",
+    "psycopg[binary]==3.3.6",
+    "python-dotenv==1.2.4",
+    "argon2-cffi==25.1.0",
+    "PyJWT==2.15.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+    "httpx2",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: tests that require external services such as Neon",
+]

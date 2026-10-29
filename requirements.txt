@@ -1,0 +1,12 @@
+﻿fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+pydantic-settings
+email-validator
+psycopg[binary]
+python-dotenv
+pytest
+httpx
+argon2-cffi==25.1.0
+PyJWT==2.15.1

@@ -1,0 +1,20 @@
+﻿# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+.venv-*/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Test and coverage artifacts
+.coverage
+htmlcov/
+
+# Local IDE settings
+.vscode/
