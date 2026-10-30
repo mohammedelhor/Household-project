@@ -323,7 +323,12 @@ def change_item_status(
         raise _not_found()
 
     try:
-        item = update_item_status(db, item_id, data.status)
+        item = update_item_status(
+            db,
+            item_id,
+            data.status,
+            actor_user_id=current_user.id,
+        )
         _commit_or_conflict(db)
         return item
     except IntegrityError:
@@ -350,7 +355,9 @@ def delete_shopping_list_item(
         raise _not_found()
 
     try:
-        archive_shopping_list_item(db, item_id)
+        archive_shopping_list_item(
+            db, item_id, actor_user_id=current_user.id
+        )
         _commit_or_conflict(db)
     except IntegrityError:
         db.rollback()
@@ -400,7 +407,9 @@ def delete_shopping_list(
             )
 
     try:
-        archive_shopping_list(db, list_id)
+        archive_shopping_list(
+            db, list_id, actor_user_id=current_user.id
+        )
         _commit_or_conflict(db)
     except IntegrityError:
         db.rollback()

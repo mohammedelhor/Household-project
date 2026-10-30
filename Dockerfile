@@ -15,6 +15,10 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev
 
 COPY backend ./backend
+# Run as an unprivileged user: if the app is ever compromised, the
+# attacker does not get root inside the container.
+RUN useradd --system --no-create-home appuser
+USER appuser
 
 EXPOSE 8000
 

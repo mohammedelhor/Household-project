@@ -9,7 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from backend.app.db.models import ShoppingList, ShoppingListItem, User
+from backend.app.db.models import ItemEvent, ShoppingList, ShoppingListItem, User
 from backend.app.services.shopping_lists import (
     add_shopping_list_item,
     create_shopping_list,
@@ -318,10 +318,20 @@ def test_committed_list_and_items_are_visible_in_new_session(test_engine):
             assert saved_items[0].product_name == "Rice"
             assert saved_items[0].quantity == Decimal("2.000")
             assert saved_items[0].unit == "kg"
+            # The 'added' event is committed in the SAME transaction.
+            saved_events = session.scalars(
+                select(ItemEvent).where(ItemEvent.list_id == list_id)
+            ).all()
+            assert [e.event_type for e in saved_events] == ["added"]
 
     finally:
         with SessionFactory() as session:
             if list_id is not None:
+                # Events reference items/lists by foreign key, so they must
+                # be deleted first (children before parents).
+                session.execute(
+                    delete(ItemEvent).where(ItemEvent.list_id == list_id)
+                )
                 session.execute(
                     delete(ShoppingListItem).where(
                         ShoppingListItem.list_id == list_id
@@ -339,4 +349,3 @@ def test_committed_list_and_items_are_visible_in_new_session(test_engine):
                 )
 
             session.commit()
-

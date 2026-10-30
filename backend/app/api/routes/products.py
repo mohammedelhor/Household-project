@@ -8,7 +8,7 @@ from backend.app.api.routes.auth import get_current_user
 from backend.app.db.database import get_db
 from backend.app.db.models import Product, User
 from backend.app.schemas.products import ProductCreate, ProductRead
-from backend.app.services.product_service import create_product
+from backend.app.services.product_service import create_product, ProductAlreadyExistsError
 
 router = APIRouter()
 
@@ -34,12 +34,19 @@ def create_product_endpoint(
         db.refresh(product)
         return product
 
+    # Order matters: ProductAlreadyExistsError is a ValueError, so it must
+    # be caught first or it would be reported as 422.
+    except ProductAlreadyExistsError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
     except ValueError as exc:
         db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT
-            if "already exists" in str(exc)
-            else status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
 

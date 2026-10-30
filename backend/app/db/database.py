@@ -8,7 +8,6 @@ engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
 )
-print("APP DATABASE:", engine.url.render_as_string(hide_password=True))
 
 SessionLocal = sessionmaker(
     bind=engine,

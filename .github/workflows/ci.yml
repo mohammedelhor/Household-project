@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # A throwaway PostgreSQL so integration tests never touch the real
+    # (Neon) database.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: household_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/household_test
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/household_test
+      # Dummy value used only inside CI: long enough to pass validation.
+      JWT_SECRET_KEY: ci-only-secret-not-used-anywhere-else-0123456789
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install uv
+      - run: uv sync --locked
+
+      # Applies every migration from scratch: catches a broken migration chain.
+      - run: uv run alembic -c backend/alembic.ini upgrade head
+
+      # Fails if models.py and the migrations disagree (forgotten migration).
+      - run: uv run alembic -c backend/alembic.ini check
+
+      # Unit tests + integration tests together.
+      - run: uv run pytest -m "integration or not integration"

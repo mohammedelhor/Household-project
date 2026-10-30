@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
+    ItemEvent,
     Product,
     ShoppingList,
     ShoppingListItem
@@ -30,7 +31,40 @@ class ProductNotFoundError(Exception):
 def _now() -> datetime:
     """Return a timezone-aware UTC timestamp."""
     return datetime.now(timezone.utc)
+def _record_event(
+    db: Session,
+    item: ShoppingListItem,
+    event_type: Literal["added", "purchased", "reverted", "archived"],
+    actor_user_id: int | None,
+    *,
+    occurred_at: datetime | None = None,
+) -> None:
+    """Append one row to the item's history (item_events).
 
+    Why a single helper: every state change must leave a trace, and doing it
+    in ONE place means no code path can forget it. The event is only added
+    to the session (flush, not commit): it is saved or rolled back together
+    with the change that caused it, in the same transaction, so history can
+    never disagree with the current state.
+
+    The item's quantity/unit/product are COPIED into the event, so later edits
+    to the item cannot rewrite what happened.
+    """
+    db.add(
+        ItemEvent(
+            item_id=item.id,
+            product_id=item.product_id,
+            list_id=item.list_id,
+            event_type=event_type,
+            quantity=item.quantity,
+            unit=item.unit,
+            actor_user_id=actor_user_id,
+            # None => the database clock (server_default now()).
+            # A shared timestamp is passed when many items are archived
+            # together, so they all carry the exact same moment.
+            occurred_at=occurred_at,
+        )
+    )
 
 def create_shopping_list(
     db: Session,
@@ -197,7 +231,9 @@ def add_shopping_list_item(
 
     db.add(item)
     db.flush()
-
+    
+    _record_event(db, item, "added", created_by_user_id)
+    db.flush()
     return item
 
 
@@ -206,6 +242,8 @@ def update_item_status(
     db: Session,
     item_id: int,
     status: Literal["needed", "purchased"],
+    *,
+    actor_user_id: int | None = None,
 ) -> ShoppingListItem:
     """Update the status of an active item."""
 
@@ -230,7 +268,13 @@ def update_item_status(
             f"Active shopping-list item {item_id} was not found."
         )
 
-    item.status = status
+    previous_status = item.status
+
+    if previous_status != status:
+        item.status = status
+        event_type = "purchased" if status == "purchased" else "reverted"
+        _record_event(db, item, event_type, actor_user_id)
+
     db.flush()
     return item
 
@@ -238,6 +282,8 @@ def update_item_status(
 def archive_shopping_list_item(
     db: Session,
     item_id: int,
+    *,
+    actor_user_id: int | None = None,
 ) -> ShoppingListItem:
     """Archive an item without deleting its database record."""
 
@@ -260,6 +306,7 @@ def archive_shopping_list_item(
         )
 
     item.archived_at = _now()
+    _record_event(db, item, "archived", actor_user_id)
     db.flush()
     return item
 
@@ -267,6 +314,8 @@ def archive_shopping_list_item(
 def archive_shopping_list(
     db: Session,
     list_id: int,
+    *,
+    actor_user_id: int | None = None,
 ) -> ShoppingList:
     """Archive a list and its active items without deleting records."""
 
@@ -277,7 +326,11 @@ def archive_shopping_list(
 
     for item in shopping_list.items:
         if item.archived_at is None:
-            item.archived_at = archived_at
-
+           item.archived_at = archived_at
+           # Same timestamp for the item and its event.
+           _record_event(
+                db, item, "archived", actor_user_id,
+                occurred_at=archived_at,
+            )
     db.flush()
     return shopping_list

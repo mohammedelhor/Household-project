@@ -29,17 +29,21 @@ backend/
     │   └── routes/
     │       ├── auth.py
     │       └── shopping.py
+                products.py
     ├── core/
     │   ├── config.py
     │   └── security.py
+            units.py
     ├── db/
     │   ├── database.py
     │   └── models.py
     ├── schemas/
     │   ├── auth.py
     │   └── shopping.py
+            products.py
     └── services/
         └── shopping_lists.py
+            product_service.py
 ```
 
 ### Responsibilities
@@ -55,6 +59,8 @@ backend/
 | `db/models.py` | SQLAlchemy database models and constraints. |
 | `schemas/` | Request validation and response serialization. |
 | `services/shopping_lists.py` | Shopping-list and shopping-item business operations. |
+| `core/units.py` | The single list of supported units (`kg`, `g`, `liter`, `ml`, `piece`) used by validation and by the database CHECK constraints. |
+| `services/product_service.py` | Product catalog operations (normalized-name uniqueness). |
 
 ## 3. Configuration
 
@@ -190,6 +196,13 @@ Authorization: Bearer <access_token>
 
 The item-status endpoint accepts `needed` or `purchased`.
 
+### Products
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/products` | Create a catalog product. A duplicate normalized name returns `409`. |
+| `GET` | `/api/v1/products/{product_id}` | Retrieve an active product. |
+
 ### Authorization behavior
 
 - Users must authenticate before accessing protected shopping endpoints.
@@ -210,6 +223,17 @@ The database module provides:
 - A `get_db` dependency that closes each session after the request.
 
 Database schema changes should be managed through the project's Alembic migrations rather than by manually modifying production tables.
+
+### Item history (`item_events`)
+
+`shopping_list_items.status` only stores the *current* state, so every change is also appended to `item_events`: `added`, `purchased`, `reverted` (purchased → needed) and `archived`. Each event copies the item's product, quantity and unit and records who did it and when (`occurred_at`).
+
+- The table is **append-only**: rows are inserted, never updated or deleted.
+- An event is written in the same transaction as the change it describes.
+- Setting an item to the status it already has records nothing.
+- Items that existed before this table received an `added` event at their real creation time. No `purchased` events were invented for them, because their real purchase time was never recorded.
+
+This table is the source for the data engineering layer.
 
 ## 9. Testing
 

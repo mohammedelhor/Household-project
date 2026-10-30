@@ -457,3 +457,81 @@ def test_add_item_requires_unit_without_product_default(db):
             product_id=product.id,
             quantity=Decimal("1"),
         )
+# ---------------------------------------------------------------------------
+# item_events: the append-only history used by the data engineering layer
+# ---------------------------------------------------------------------------
+
+def _events(db, item_id):
+    """Return the item's events in the order they were recorded."""
+    from backend.app.db.models import ItemEvent
+
+    return list(
+        db.scalars(
+            select(ItemEvent)
+            .where(ItemEvent.item_id == item_id)
+            .order_by(ItemEvent.id)
+        )
+    )
+
+
+def test_adding_item_records_added_event_with_copied_values(db):
+    shopping_list = create_test_list(db)
+    item = create_test_item(db, shopping_list.id)
+
+    (event,) = _events(db, item.id)
+
+    assert event.event_type == "added"
+    assert event.list_id == shopping_list.id
+    # Values are COPIED, so history survives later edits to the item.
+    assert event.quantity == Decimal("2")
+    assert event.unit == "kg"
+
+
+def test_purchase_then_revert_keeps_full_history(db):
+    shopping_list = create_test_list(db)
+    item = create_test_item(db, shopping_list.id)
+    user_id = shopping_list.owner_user_id
+
+    update_item_status(db, item.id, "purchased", actor_user_id=user_id)
+    update_item_status(db, item.id, "needed", actor_user_id=user_id)
+
+    events = _events(db, item.id)
+
+    # The mistaken purchase is NOT erased: that was the original problem.
+    assert [e.event_type for e in events] == ["added", "purchased", "reverted"]
+    assert events[1].actor_user_id == user_id
+
+
+def test_setting_same_status_records_no_event(db):
+    shopping_list = create_test_list(db)
+    item = create_test_item(db, shopping_list.id)
+
+    update_item_status(db, item.id, "needed")  # already "needed"
+
+    assert [e.event_type for e in _events(db, item.id)] == ["added"]
+
+
+def test_archiving_item_records_archived_event(db):
+    shopping_list = create_test_list(db)
+    item = create_test_item(db, shopping_list.id)
+
+    archive_shopping_list_item(db, item.id)
+
+    assert [e.event_type for e in _events(db, item.id)] == ["added", "archived"]
+
+
+def test_archiving_list_records_archived_event_per_active_item_only(db):
+    shopping_list = create_test_list(db)
+    already_archived = create_test_item(db, shopping_list.id)
+    active = add_shopping_list_item(
+        db, shopping_list.id, product_name="Milk",
+        quantity=Decimal("1"), unit="liter",
+    )
+    archive_shopping_list_item(db, already_archived.id)
+
+    archive_shopping_list(db, shopping_list.id)
+
+    # Exactly one 'archived' event each: no duplicate for the item that was
+    # archived earlier.
+    assert [e.event_type for e in _events(db, already_archived.id)] == ["added", "archived"]
+    assert [e.event_type for e in _events(db, active.id)] == ["added", "archived"]

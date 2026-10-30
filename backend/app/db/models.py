@@ -19,7 +19,19 @@ from sqlalchemy.orm import (
     mapped_column,
     relationship,
 )
+from backend.app.core.units import SUPPORTED_UNITS
 
+def _unit_check_sql(column: str) -> str:
+    """Build `column IN ('g', 'kg', ...)` from the single list of supported units.
+
+    Why: the app already validates units (core/units.py), but the data
+    engineering layer reads the database directly. A CHECK constraint makes
+    the database itself refuse a bad unit, whoever the writer is.
+    NOTE: migrations must keep a frozen literal copy of this list so old
+    migrations never change when this list grows.
+    """
+    quoted = ", ".join(f"'{u}'" for u in sorted(SUPPORTED_UNITS))
+    return f"{column} IN ({quoted})"
 
 class Base(DeclarativeBase):
     pass
@@ -150,6 +162,10 @@ class Product(Base):
         UniqueConstraint(
             "normalized_name",
             name="uq_product_normalized_name",
+        ),
+        CheckConstraint(
+            f"default_unit IS NULL OR {_unit_check_sql('default_unit')}",
+            name="ck_product_default_unit_supported",
         ),
     )
 
@@ -323,6 +339,10 @@ class ShoppingListItem(Base):
         nullable=False,
         default="needed",
     )
+    CheckConstraint(
+        _unit_check_sql("unit"),
+        name="ck_shopping_list_item_unit_supported",
+        ),
 
     created_by_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -348,3 +368,98 @@ class ShoppingListItem(Base):
         back_populates="shopping_list_items",
     )
     created_by: Mapped["User | None"] = relationship()
+    events: Mapped[list["ItemEvent"]] = relationship(
+        back_populates="item",
+    )
+class ItemEvent(Base):
+    """Append-only history of what happened to a shopping-list item.
+
+    WHY THIS TABLE EXISTS
+    ShoppingListItem only stores the *current* state (status = needed /
+    purchased). The data engineering layer needs the *history*: "rice was
+    bought on the 3rd, again on the 19th" => consumption rate. A status
+    column overwrites itself, so history would be lost. Rows here are only
+    ever INSERTED, never updated or deleted.
+
+    Denormalized on purpose (product_id, quantity, unit, list_id are copied
+    from the item at event time): analytics should not need to join back to
+    mutable rows, and the values must stay as they were when it happened.
+    """
+
+    __tablename__ = "item_events"
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('added', 'purchased', 'reverted', 'archived')",
+            name="ck_item_event_type",
+        ),
+        CheckConstraint(
+            "quantity > 0",
+            name="ck_item_event_quantity_positive",
+        ),
+        CheckConstraint(
+            _unit_check_sql("unit"),
+            name="ck_item_event_unit_supported",
+        ),
+        # Typical DE query: "all events of this product over time".
+        Index(
+            "ix_item_events_product_id_occurred_at",
+            "product_id",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    item_id: Mapped[int] = mapped_column(
+        ForeignKey("shopping_list_items.id"),
+        nullable=False,
+        index=True,
+    )
+
+    # Copied from the item (see class docstring). Nullable because custom
+    # items have no catalog product, and a deleted product must not delete
+    # history.
+    product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("shopping_lists.id"),
+        nullable=False,
+        index=True,
+    )
+
+    event_type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+
+    quantity: Mapped[Decimal] = mapped_column(
+        Numeric(12, 3),
+        nullable=False,
+    )
+
+    unit: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+    )
+
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    item: Mapped["ShoppingListItem"] = relationship(
+        back_populates="events",
+    )

@@ -224,7 +224,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx", specifier = "==0.28.1" },
-    { name = "httpx2" },
+    { name = "httpx2", specifier = "==2.16.0" },
     { name = "pytest", specifier = "==9.1.1" },
 ]
 

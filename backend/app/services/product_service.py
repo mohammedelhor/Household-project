@@ -9,6 +9,13 @@ from backend.app.core.units import normalize_unit
 
 from backend.app.db.models import Product
 
+class ProductAlreadyExistsError(ValueError):
+    """A product with the same normalized name already exists.
+
+    Subclasses ValueError so existing `except ValueError` callers keep
+    working, but the API can now tell "duplicate" (409) from "invalid
+    input" (422) by TYPE instead of searching the message text.
+    """
 
 def normalize_product_name(name: str) -> str:
     """Normalize a product name for consistent matching."""
@@ -56,7 +63,9 @@ def create_product(
     )
 
     if existing_product is not None:
-        raise ValueError("A product with this name already exists.")
+        raise ProductAlreadyExistsError(
+            "A product with this name already exists."
+        )
 
     product = Product(
         name=clean_name,
@@ -65,14 +74,19 @@ def create_product(
         category=category,
     )
 
-    db.add(product)
-
+    # Two requests can pass the "already exists?" check above at the same
+    # time; the UNIQUE constraint then rejects the second INSERT. We run the
+    # INSERT inside a SAVEPOINT (begin_nested) so only this insert is undone.
+    # The old code called db.rollback(), which also threw away the caller's
+    # other pending work, contradicting this function's own docstring.
+    
     try:
-        db.flush()
+        with db.begin_nested():
+            db.add(product)
+            db.flush()
     except IntegrityError as exc:
-        db.rollback()
-        raise ValueError(
-            "Product could not be created because of a database constraint."
+        raise ProductAlreadyExistsError(
+            "A product with this name already exists."
         ) from exc
 
     return product

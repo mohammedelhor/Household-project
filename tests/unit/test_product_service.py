@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.app.db.models import Product
 from backend.app.services.product_service import (
+    ProductAlreadyExistsError,
     create_product,
     get_product_by_id,
     get_product_by_name,
@@ -98,7 +99,10 @@ def test_create_product_rejects_duplicate():
     db.add.assert_not_called()
 
 
-def test_create_product_rolls_back_on_integrity_error():
+def test_create_product_race_duplicate_raises_already_exists_without_rollback():
+    # Simulates two requests racing: the pre-check passes, but the UNIQUE
+    # constraint rejects the INSERT. It must be reported as a duplicate
+    # (-> HTTP 409) and must NOT roll back the caller's whole transaction.
     db = MagicMock()
     db.scalar.return_value = None
     db.flush.side_effect = IntegrityError(
@@ -107,10 +111,11 @@ def test_create_product_rolls_back_on_integrity_error():
         Exception("unique constraint"),
     )
 
-    with pytest.raises(ValueError, match="database constraint"):
+    with pytest.raises(ProductAlreadyExistsError, match="already exists"):
         create_product(db, name="Milk Powder")
 
-    db.rollback.assert_called_once_with()
+    db.begin_nested.assert_called_once_with()
+    db.rollback.assert_not_called()
 
 
 def test_get_product_by_id():
