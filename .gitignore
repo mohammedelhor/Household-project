@@ -18,3 +18,5 @@ htmlcov/
 
 # Local IDE settings
 .vscode/
+data/
+data/
