@@ -22,6 +22,17 @@ with the reason, so a person can look at it.
 An item with an inconsistent history is quarantined AS A WHOLE. If one of its
 events is wrong we cannot know which purchase time to believe.
 
+TWO MORE SAFETY RULES
+---------------------
+- DUPLICATE IDS: the same event id in two raw files is normal after a re-run,
+  and harmless when the copies are identical (counted and ignored). If the
+  copies DIFFER, the source or the extraction is broken: we keep neither,
+  quarantine the item(s) involved and make the run end with an error code.
+- ALL-OR-NOTHING OUTPUT: the three result files are published together as
+  one "run" folder, and a small pointer file is switched to it in one atomic
+  step (see `publish_run`). A reader sees the previous complete run or the
+  new complete run, never a mixture.
+
 KNOWN SIMPLIFICATION
 --------------------
 "Day" means the UTC date. The household lives in another time zone, so a
@@ -38,17 +49,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import os
+import shutil
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, fields
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from backend.app.core.units import SUPPORTED_UNITS
 from data_engineering.extract import DEFAULT_OUT_DIR as DEFAULT_RAW_DIR
-from data_engineering.extract import write_csv_atomic
+from data_engineering.extract import render_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLEAN_DIR = PROJECT_ROOT / "data" / "clean"
@@ -140,8 +154,9 @@ def load_events(raw_dir: Path) -> tuple[list[Event], list[Quarantined], dict]:
     """Read every batch file. Returns (valid-looking events, rows that could
     not even be parsed, statistics)."""
     events: dict[int, Event] = {}
+    conflicted: set[int] = set()   # ids seen with two different contents
     unparsed: list[Quarantined] = []
-    stats = {"files": 0, "rows_read": 0, "duplicates": 0}
+    stats = {"files": 0, "rows_read": 0, "duplicates": 0, "conflicts": 0}
 
     for path in sorted((raw_dir / "item_events").glob("item_events_*.csv")):
         stats["files"] += 1
@@ -156,10 +171,27 @@ def load_events(raw_dir: Path) -> tuple[list[Event], list[Quarantined], dict]:
                         f"unparseable row: {exc}",
                     ))
                     continue
+                if event.id in conflicted:
+                    continue  # already reported; a third copy adds nothing
                 if event.id in events:
-                    # The same id in two files (e.g. a re-run). Keep the first;
-                    # the source is append-only so both copies are identical.
-                    stats["duplicates"] += 1
+                    kept = events[event.id]
+                    if event == kept:
+                        # A re-run wrote the same row again. Harmless.
+                        stats["duplicates"] += 1
+                        continue
+                    # Same id, different content. The source is append-only,
+                    # so this should be impossible: something is broken, and
+                    # we cannot know which copy is true. Keep NEITHER, and
+                    # taint every item either copy claims to belong to.
+                    differing = [f.name for f in fields(Event)
+                                 if getattr(kept, f.name) != getattr(event, f.name)]
+                    reason = (f"conflicting copies of event id {event.id} "
+                              f"(differ in: {', '.join(differing)})")
+                    stats["conflicts"] += 1
+                    del events[event.id]
+                    conflicted.add(event.id)
+                    for item_id in sorted({kept.item_id, event.item_id}):
+                        unparsed.append(Quarantined(event.id, item_id, reason))
                     continue
                 events[event.id] = event
 
@@ -188,6 +220,40 @@ def load_product_names(raw_dir: Path) -> dict[int, tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Replaying each item
 # ---------------------------------------------------------------------------
+
+# Fields that describe WHAT the item is. The backend has no endpoint that
+# edits them after creation, and every event copies them from the item, so all
+# events of one item must carry identical values. (item_id is the grouping key,
+# so it is the same by construction; actor_user_id and occurred_at legitimately
+# differ per event and are not checked.)
+#
+# If the backend ever gains an "edit quantity/unit" feature, this rule must be
+# revisited, otherwise legitimate edits would quarantine whole items.
+CONSTANT_FIELDS = ("list_id", "product_id", "quantity", "unit")
+
+
+def check_item_consistency(events: list[Event]) -> str | None:
+    """Cross-event check: do all events of one item agree on what the item is?
+
+    Every event can be valid on its own and the sequence of states can be
+    correct, while the events still describe different things, for example
+    added(product 10, qty 2) -> purchased(product 15, qty 5). Whichever
+    event we trusted for the purchase would be a guess, so the whole item
+    is rejected (the caller quarantines it) and the reason lists every
+    field that disagrees.
+    """
+    first = events[0]
+    problems = []
+    for field in CONSTANT_FIELDS:
+        values = [getattr(e, field) for e in events]
+        if any(v != values[0] for v in values[1:]):
+            # dict.fromkeys keeps order and removes repeats: "10 -> 15 -> 10"
+            shown = " -> ".join(str(v) for v in dict.fromkeys(values))
+            problems.append(f"{field} ({shown})")
+    if problems:
+        return "inconsistent within item: " + ", ".join(problems)
+    return None
+
 
 def evaluate_item(events: list[Event]) -> tuple[Purchase | None, str | None]:
     """Replay one item's history (already in time order).
@@ -265,6 +331,10 @@ def build_purchases(
         reason = tainted.get(item_id)
         purchase = None
         if reason is None:
+            # Rule 2: do the events agree on what the item is?
+            reason = check_item_consistency(item_events)
+        if reason is None:
+            # Rule 3: is the sequence of states possible?
             purchase, reason = evaluate_item(item_events)
 
         if reason is not None:
@@ -351,6 +421,82 @@ def compare_with_truth(summary: dict[str, dict], truth: dict) -> list[dict]:
 # Command line
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Publishing the results as ONE unit
+# ---------------------------------------------------------------------------
+#
+# Layout:
+#   clean/_latest.json                 <- pointer: {"run_id": ...}
+#   clean/runs/<run_id>/purchases.csv, purchase_intervals.csv, quarantine.csv
+#
+# Writing each file atomically is not enough: a crash after the first file
+# leaves a mixture of two runs. Instead:
+#   1. write all files into a hidden staging folder,
+#   2. rename the folder to runs/<run_id>  (one atomic rename),
+#   3. switch the pointer file to it       (one atomic rename).
+# Step 3 is the COMMIT. Before it, readers still see the previous run; after
+# it, the new one. There is no moment with a mixture.
+#
+# The run id is a hash of the content, so re-running on unchanged data
+# produces the same id and creates nothing new.
+
+RUNS_DIR = "runs"
+POINTER_FILE = "_latest.json"
+KEEP_RUNS = 5   # the current run plus the most recent older ones
+
+
+def publish_run(out_dir: Path, tables: dict[str, str]) -> str:
+    """Publish rendered CSV texts as one run. Returns the run id."""
+    digest = hashlib.sha256()
+    for name in sorted(tables):
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(tables[name].encode("utf-8") + b"\0")
+    run_id = digest.hexdigest()[:12]
+
+    runs = out_dir / RUNS_DIR
+    runs.mkdir(parents=True, exist_ok=True)
+    for leftover in runs.glob(".tmp-*"):          # from an earlier crash
+        shutil.rmtree(leftover, ignore_errors=True)
+
+    run_dir = runs / run_id
+    if not run_dir.exists():
+        staging = runs / f".tmp-{run_id}"
+        staging.mkdir()
+        for name, text in tables.items():
+            # newline="" writes the text exactly as rendered by the csv module.
+            (staging / name).write_text(text, encoding="utf-8", newline="")
+        os.replace(staging, run_dir)               # the folder appears complete
+
+    pointer = out_dir / POINTER_FILE
+    temporary = pointer.with_name(pointer.name + ".tmp")
+    temporary.write_text(json.dumps({
+        "run_id": run_id,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        "files": sorted(tables),
+    }, indent=2), encoding="utf-8")
+    os.replace(temporary, pointer)                 # COMMIT
+
+    # Tidy up AFTER the commit: a failure here cannot hurt the result.
+    older = sorted(
+        (d for d in runs.iterdir()
+         if d.is_dir() and d.name != run_id and not d.name.startswith(".")),
+        key=lambda d: d.stat().st_mtime, reverse=True,
+    )
+    for old in older[KEEP_RUNS - 1:]:
+        shutil.rmtree(old, ignore_errors=True)
+    return run_id
+
+
+def latest_clean_dir(out_dir: Path) -> Path:
+    """The folder holding the newest COMPLETE results. Consumers (the ML
+    layer) use this instead of hard-coding paths."""
+    pointer = out_dir / POINTER_FILE
+    if not pointer.exists():
+        raise FileNotFoundError(f"No published results in {out_dir}. Run the pipeline first.")
+    run_id = json.loads(pointer.read_text(encoding="utf-8"))["run_id"]
+    return out_dir / RUNS_DIR / run_id
+
+
 def run(raw_dir: Path, out_dir: Path, truth_path: Path | None = None) -> int:
     """Clean the raw files and report. Returns 0 on success, 1 on a problem
     (no input, or a mismatch with the answer key)."""
@@ -368,30 +514,41 @@ def run(raw_dir: Path, out_dir: Path, truth_path: Path | None = None) -> int:
     intervals = compute_intervals(purchases, names)
     summary = summarise_by_product(purchases, intervals, names)
 
-    write_csv_atomic(
-        out_dir / "purchases.csv",
-        ("item_id", "product_id", "product_name", "list_id", "quantity",
-         "unit", "purchased_at", "purchase_date"),
-        [
-            {**vars(p), "purchase_date": p.purchase_date,
-             "product_name": names.get(p.product_id, ("", ""))[0]}
-            for p in purchases
-        ],
-    )
-    write_csv_atomic(
-        out_dir / "purchase_intervals.csv",
-        ("product_id", "product_name", "previous_purchase_date",
-         "purchase_date", "days_since_previous"),
-        intervals,
-    )
-    write_csv_atomic(
-        out_dir / "quarantine.csv",
-        ("event_id", "item_id", "reason"),
-        [vars(q) for q in quarantined],
-    )
+    # Render all three files in memory first, then publish them together.
+    tables = {
+        "purchases.csv": render_csv(
+            ("item_id", "product_id", "product_name", "list_id", "quantity",
+             "unit", "purchased_at", "purchase_date"),
+            [
+                {**vars(p), "purchase_date": p.purchase_date,
+                 "product_name": names.get(p.product_id, ("", ""))[0]}
+                for p in purchases
+            ],
+        ),
+        "purchase_intervals.csv": render_csv(
+            ("product_id", "product_name", "previous_purchase_date",
+             "purchase_date", "days_since_previous"),
+            intervals,
+        ),
+        "quarantine.csv": render_csv(
+            ("event_id", "item_id", "reason"),
+            [vars(q) for q in quarantined],
+        ),
+    }
+    run_id = publish_run(out_dir, tables)
 
+
+    problem = False
+    print(f"published run {run_id} ({out_dir / RUNS_DIR / run_id})")
     print(f"read {stats['rows_read']} rows from {stats['files']} file(s); "
           f"{stats['duplicates']} duplicate(s) ignored")
+    if stats["conflicts"]:
+        # The items are isolated, so the numbers are safe, but a conflict is
+        # a fault in the pipeline or the source: signal it with an error code.
+        problem = True
+        print(f"ERROR: {stats['conflicts']} event id(s) appear twice with "
+              "DIFFERENT content. Items involved were quarantined; investigate "
+              "the source and the extraction.")
     print(f"{len(purchases)} purchases, {len(quarantined)} event(s) quarantined\n")
     print(f"{'product':<12}{'purchases':>10}{'avg days':>10}")
     for entry in summary.values():
@@ -411,9 +568,9 @@ def run(raw_dir: Path, out_dir: Path, truth_path: Path | None = None) -> int:
         for result in results:
             print(f"  {'OK  ' if result['ok'] else 'FAIL'} {result['product']:<12}{result['detail']}")
         if not all(r["ok"] for r in results):
-            return 1
+            problem = True
 
-    return 0
+    return 1 if problem else 0
 
 
 def main() -> int:

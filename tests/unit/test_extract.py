@@ -13,9 +13,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from backend.app.db.models import Base, ItemEvent, Product
+from sqlalchemy import delete
+
 from data_engineering.extract import (
     extract_item_events,
     extract_products_snapshot,
+    read_extracted_ids,
+    reconcile_item_events,
+    run,
     take_stable_prefix,
 )
 
@@ -230,3 +235,91 @@ def test_an_edit_to_an_existing_product_is_captured(engine, tmp_path):
     later = extract_products_snapshot(engine, tmp_path, now=NOW + timedelta(hours=1))
 
     assert read_rows(later)[0]["category"] == "grains"
+
+
+# ------------------------------ reconciliation -------------------------
+# The scenario: transaction A got id 2 but commits LATE, after id 3 was
+# already extracted and the bookmark moved to 3. The "id > bookmark" query
+# can never see row 2 again; reconciliation must.
+
+def _extract_with_a_late_row(engine, tmp_path):
+    add_event(engine, 1)
+    add_event(engine, 3)
+    extract_item_events(engine, tmp_path, now=NOW)       # bookmark = 3, row 2 not visible yet
+    add_event(engine, 2)                                  # A commits late
+
+
+def test_a_row_that_commits_after_the_bookmark_passed_it_is_recovered(engine, tmp_path):
+    _extract_with_a_late_row(engine, tmp_path)
+
+    assert extract_item_events(engine, tmp_path, now=NOW) is None   # the normal path misses it
+
+    result = reconcile_item_events(engine, tmp_path, now=NOW)
+
+    assert result.recovered == 1
+    assert [r["id"] for r in read_rows(result.late_file)] == ["2"]
+    assert read_extracted_ids(tmp_path) == {1, 2, 3}
+
+
+def test_reconciling_again_does_nothing(engine, tmp_path):
+    _extract_with_a_late_row(engine, tmp_path)
+    reconcile_item_events(engine, tmp_path, now=NOW)
+    files_before = sorted(p.name for p in (tmp_path / "item_events").glob("*.csv"))
+
+    again = reconcile_item_events(engine, tmp_path, now=NOW)
+
+    assert again.recovered == 0 and again.late_file is None
+    assert sorted(p.name for p in (tmp_path / "item_events").glob("*.csv")) == files_before
+
+
+def test_no_gap_means_no_late_file(engine, tmp_path):
+    for event_id in (1, 2, 3):
+        add_event(engine, event_id)
+    extract_item_events(engine, tmp_path, now=NOW)
+
+    result = reconcile_item_events(engine, tmp_path, now=NOW)
+
+    assert result.recovered == 0
+    assert len(list((tmp_path / "item_events").glob("*.csv"))) == 1
+
+
+def test_rolled_back_ids_are_not_mistaken_for_missing_rows(engine, tmp_path):
+    # Ids 2 and 3 never existed (rolled back): a gap in ids, not in rows.
+    add_event(engine, 1)
+    add_event(engine, 4)
+    extract_item_events(engine, tmp_path, now=NOW)
+
+    assert reconcile_item_events(engine, tmp_path, now=NOW).recovered == 0
+
+
+def test_different_late_batches_never_overwrite_each_other(engine, tmp_path):
+    _extract_with_a_late_row(engine, tmp_path)
+    first = reconcile_item_events(engine, tmp_path, now=NOW)
+    add_event(engine, 2_000)
+    extract_item_events(engine, tmp_path, now=NOW)       # bookmark moves up to 2000
+    add_event(engine, 1_500)                             # a second row commits late
+    second = reconcile_item_events(engine, tmp_path, now=NOW)
+
+    assert first.late_file != second.late_file
+    assert first.late_file.exists() and second.late_file.exists()
+
+
+def test_rows_deleted_in_the_source_are_reported_but_our_copy_is_kept(engine, tmp_path):
+    for event_id in (1, 2):
+        add_event(engine, event_id)
+    extract_item_events(engine, tmp_path, now=NOW)
+    with engine.begin() as connection:
+        connection.execute(delete(ItemEvent).where(ItemEvent.id == 2))
+
+    result = reconcile_item_events(engine, tmp_path, now=NOW)
+
+    assert result.vanished == 1 and result.recovered == 0
+    assert read_extracted_ids(tmp_path) == {1, 2}
+
+
+def test_run_prints_a_warning_when_it_recovers_late_rows(engine, tmp_path, capsys):
+    _extract_with_a_late_row(engine, tmp_path)
+
+    run(tmp_path, engine=engine, now=NOW)
+
+    assert "had committed late" in capsys.readouterr().out

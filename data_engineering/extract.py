@@ -28,6 +28,16 @@ THREE DECISIONS WORTH UNDERSTANDING
 3. ATOMIC WRITES. Files are written under a temporary name and renamed when
    complete, so a crash never leaves a half-written file that looks valid.
 
+4. RECONCILIATION (the safety net under decision 1). The safety lag is only
+   an ASSUMPTION: it holds if no transaction stays open longer than the lag.
+   If one does, a row can commit AFTER we moved the bookmark past its id, and
+   the "id > bookmark" query would never see it. So after every extraction we
+   compare what the source holds up to the bookmark with the ids we have in
+   our files. Rows that arrived late are fetched into a separate "late" batch
+   file; nothing is lost and nothing is silently assumed.
+   (Preventing the cause is the database's job: a timeout on idle
+   transactions, so the assumption is actually enforced.)
+
 COUPLING NOTE
 -------------
 This file imports the table definitions from backend/app/db/models.py. That
@@ -51,14 +61,16 @@ import argparse
 import csv
 import io
 import json
+import hashlib
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.engine import Engine
 
 from backend.app.db.models import ItemEvent, Product
@@ -263,6 +275,85 @@ def extract_products_snapshot(
     return path
 
 
+@dataclass(frozen=True)
+class Reconciliation:
+    recovered: int = 0            # rows that had committed late and were fetched now
+    late_file: Path | None = None
+    vanished: int = 0             # ids we hold that the source no longer has
+
+
+def read_extracted_ids(out_dir: Path) -> set[int]:
+    """Every event id present in our batch files (duplicates collapse)."""
+    ids: set[int] = set()
+    for path in (out_dir / "item_events").glob("item_events_*.csv"):
+        with open(path, newline="", encoding="utf-8") as handle:
+            ids.update(int(row["id"]) for row in csv.DictReader(handle))
+    return ids
+
+
+def reconcile_item_events(
+    engine: Engine,
+    out_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> Reconciliation:
+    """Find rows with id <= bookmark that exist in the source but not in our
+    files, and fetch them. See "RECONCILIATION" at the top of this file.
+
+    Cost: one COUNT per run (cheap, uses the primary key). The list of ids is
+    only fetched when the counts disagree. Reading our own ids is a local
+    file scan; fine at this size, and an easy thing to optimise later.
+    """
+    now = _as_utc(now) if now else datetime.now(timezone.utc)
+    watermark = read_state(out_dir).get("item_events_last_id", 0)
+    if watermark == 0:
+        return Reconciliation()
+
+    table = ItemEvent.__table__
+    ours = read_extracted_ids(out_dir)
+
+    with engine.connect() as connection:
+        source_count = connection.execute(
+            select(func.count()).select_from(table).where(table.c.id <= watermark)
+        ).scalar_one()
+        if source_count == len(ours):
+            return Reconciliation()   # same number of rows: nothing arrived late
+
+        source_ids = set(connection.execute(
+            select(table.c.id).where(table.c.id <= watermark)
+        ).scalars())
+
+        missing = sorted(source_ids - ours)
+        vanished = len(ours - source_ids)
+
+        rows = []
+        for start in range(0, len(missing), 1000):     # keep IN lists a sane size
+            chunk = missing[start:start + 1000]
+            query = (
+                select(*(table.c[name] for name in EVENT_COLUMNS))
+                .where(table.c.id.in_(chunk))
+                .order_by(table.c.id)
+            )
+            rows += connection.execute(query).mappings().all()
+
+    if not rows:
+        return Reconciliation(vanished=vanished)
+
+    # The name carries the id range AND a short hash of the exact id list, so
+    # two different late batches can never overwrite each other, while the
+    # same batch rewritten after a crash gets the same name (idempotent).
+    ids = [row["id"] for row in rows]
+    digest = hashlib.sha256(",".join(map(str, ids)).encode()).hexdigest()[:8]
+    path = out_dir / "item_events" / f"item_events_late_{ids[0]:09d}_{ids[-1]:09d}_{digest}.csv"
+    write_csv_atomic(path, EVENT_COLUMNS, rows)
+    append_manifest(out_dir, {
+        "table": "item_events", "file": path.name, "rows": len(rows),
+        "first_id": ids[0], "last_id": ids[-1], "late": True,
+        "extracted_at": now.isoformat(),
+    })
+    return Reconciliation(recovered=len(rows), late_file=path, vanished=vanished)
+
+
 def run(
     out_dir: Path,
     *,
@@ -276,8 +367,19 @@ def run(
     events_path = extract_item_events(
         engine, out_dir, lag_minutes=lag_minutes, max_rows=max_rows, now=now
     )
+    reconciliation = reconcile_item_events(engine, out_dir, now=now)
     products_path = extract_products_snapshot(engine, out_dir, now=now)
 
+    if reconciliation.recovered:
+        # The lag assumption failed once; we healed it, but a person should
+        # know, because it means some transaction stayed open too long.
+        print(f"WARNING: {reconciliation.recovered} event(s) had committed late "
+              f"and were recovered into {reconciliation.late_file.name}. "
+              "Check for long-running transactions in the application.")
+    if reconciliation.vanished:
+        print(f"WARNING: {reconciliation.vanished} event id(s) we extracted earlier "
+              "no longer exist in the source. Our copies are kept. The table is "
+              "meant to be append-only, so find out who deleted them.")
     if events_path:
         print(f"item_events: wrote {events_path.name}")
     else:

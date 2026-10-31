@@ -19,6 +19,9 @@ from data_engineering.transform import (
     Event,
     Purchase,
     build_purchases,
+    check_item_consistency,
+    latest_clean_dir,
+    publish_run,
     compare_with_truth,
     compute_intervals,
     evaluate_item,
@@ -32,9 +35,10 @@ from data_engineering.transform import (
 T0 = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
 
 
-def ev(event_id, kind, minutes=0, item_id=1, product_id=1, quantity="2", unit="kg"):
+def ev(event_id, kind, minutes=0, item_id=1, product_id=1, quantity="2", unit="kg",
+       list_id=1):
     return Event(
-        id=event_id, item_id=item_id, product_id=product_id, list_id=1,
+        id=event_id, item_id=item_id, product_id=product_id, list_id=list_id,
         event_type=kind, quantity=Decimal(quantity), unit=unit, actor_user_id=1,
         occurred_at=T0 + timedelta(minutes=minutes),
     )
@@ -176,6 +180,60 @@ def test_one_bad_event_quarantines_the_whole_item_but_not_others():
     assert [p.item_id for p in purchases] == [2]
     assert {q.event_id for q in quarantined} == {1, 2}
     assert all("unsupported unit" in q.reason for q in quarantined)
+
+
+# ---------------------- cross-event consistency ------------------------
+
+@pytest.mark.parametrize("changed, field", [
+    ({"product_id": 15}, "product_id (1 -> 15)"),
+    ({"quantity": "5"}, "quantity (2 -> 5)"),
+    ({"unit": "g"}, "unit (kg -> g)"),
+    ({"list_id": 9}, "list_id (1 -> 9)"),
+])
+def test_an_item_whose_events_disagree_is_quarantined(changed, field):
+    # Each event is valid alone and the state sequence is fine.
+    events = [ev(1, "added"), ev(2, "purchased", 5, **changed), ev(3, "archived", 9)]
+
+    purchases, quarantined = build_purchases(events)
+
+    assert purchases == []
+    assert {q.event_id for q in quarantined} == {1, 2, 3}
+    assert all(field in q.reason for q in quarantined)
+
+
+def test_the_reason_lists_every_field_that_disagrees():
+    events = [ev(1, "added", product_id=10, quantity="2"),
+              ev(2, "purchased", 5, product_id=15, quantity="5")]
+
+    reason = check_item_consistency(events)
+
+    assert "product_id (10 -> 15)" in reason and "quantity (2 -> 5)" in reason
+
+
+def test_same_value_written_differently_is_not_a_disagreement():
+    # 2 and 2.000 are the same quantity once parsed as numbers.
+    events = [ev(1, "added", quantity="2"), ev(2, "purchased", 5, quantity="2.000")]
+
+    assert check_item_consistency(events) is None
+
+
+def test_null_product_on_every_event_is_consistent():
+    # Free-text items have no product_id at all; that is constant, not a clash.
+    events = [ev(1, "added", product_id=None), ev(2, "purchased", 5, product_id=None)]
+
+    assert check_item_consistency(events) is None
+
+
+def test_an_inconsistent_item_does_not_affect_other_items():
+    events = [
+        ev(1, "added", item_id=1), ev(2, "purchased", 5, item_id=1, quantity="9"),
+        ev(3, "added", item_id=2), ev(4, "purchased", 5, item_id=2),
+    ]
+
+    purchases, quarantined = build_purchases(events)
+
+    assert [p.item_id for p in purchases] == [2]
+    assert {q.event_id for q in quarantined} == {1, 2}
 
 
 def test_unparseable_rows_taint_their_item():
@@ -324,7 +382,7 @@ def test_command_line_writes_files_and_checks_the_answer_key(tmp_path, monkeypat
     assert code == 0
     assert "FAIL" not in capsys.readouterr().out
     for name in ("purchases.csv", "purchase_intervals.csv", "quarantine.csv"):
-        assert (clean / name).exists()
+        assert (latest_clean_dir(clean) / name).exists()
 
 
 def test_command_line_without_raw_files_explains_what_to_do(tmp_path, monkeypatch, capsys):
@@ -332,3 +390,131 @@ def test_command_line_without_raw_files_explains_what_to_do(tmp_path, monkeypatc
 
     assert transform.main() == 1
     assert "Run the extraction first" in capsys.readouterr().out
+
+
+def test_late_batch_files_are_read_like_any_other_batch(tmp_path):
+    _write_batch(tmp_path, "item_events_000000001_000000003.csv",
+                 [_raw_row(1), _raw_row(3, kind="archived")])
+    _write_batch(tmp_path, "item_events_late_000000002_000000002_ab12cd34.csv",
+                 [_raw_row(2, kind="purchased")])
+
+    events, _, stats = load_events(tmp_path)
+
+    assert sorted(e.id for e in events) == [1, 2, 3] and stats["files"] == 2
+
+
+# ----------------------- conflicting duplicate ids ---------------------
+
+def _write_batch(raw_dir, name, rows):
+    write_csv_atomic(raw_dir / "item_events" / name, EVENT_COLUMNS, rows)
+
+
+def _raw_row(event_id, item_id=1, kind="added", product_id=1, quantity="2"):
+    return {"id": event_id, "item_id": item_id, "product_id": product_id, "list_id": 1,
+            "event_type": kind, "quantity": quantity, "unit": "kg", "actor_user_id": 1,
+            "occurred_at": "2026-10-01T10:00:00+00:00"}
+
+
+def test_same_id_with_different_content_is_a_conflict_not_a_silent_choice(tmp_path):
+    _write_batch(tmp_path, "item_events_000000001_000000002.csv",
+                 [_raw_row(1), _raw_row(2, kind="purchased")])
+    _write_batch(tmp_path, "item_events_000000003_000000004.csv",
+                 [_raw_row(2, kind="purchased", quantity="9")])   # id 2 again, different
+
+    events, unparsed, stats = load_events(tmp_path)
+
+    assert stats["conflicts"] == 1 and stats["duplicates"] == 0
+    assert [e.id for e in events] == [1]                  # neither copy of id 2 is kept
+    assert unparsed[0].event_id == 2 and "differ in: quantity" in unparsed[0].reason
+
+
+def test_a_conflict_quarantines_the_whole_item_and_fails_the_run(tmp_path, capsys):
+    raw, clean = tmp_path / "raw", tmp_path / "clean"
+    _write_batch(raw, "item_events_000000001_000000002.csv",
+                 [_raw_row(1), _raw_row(2, kind="purchased")])
+    _write_batch(raw, "item_events_000000003_000000003.csv",
+                 [_raw_row(2, kind="purchased", quantity="9")])
+    write_csv_atomic(raw / "products" / "products_20261031T000000Z.csv", PRODUCT_COLUMNS, [])
+
+    code = transform.run(raw, clean)
+
+    assert code == 1
+    assert "DIFFERENT content" in capsys.readouterr().out
+    quarantine = (latest_clean_dir(clean) / "quarantine.csv").read_text(encoding="utf-8")
+    assert "conflicting copies of event id 2" in quarantine
+    purchases = (latest_clean_dir(clean) / "purchases.csv").read_text(encoding="utf-8")
+    assert len(purchases.strip().splitlines()) == 1       # header only: no purchase from item 1
+
+
+def test_conflict_between_copies_that_claim_different_items_taints_both(tmp_path):
+    _write_batch(tmp_path, "item_events_000000001_000000001.csv", [_raw_row(1, item_id=1)])
+    _write_batch(tmp_path, "item_events_000000002_000000002.csv", [_raw_row(1, item_id=2)])
+
+    _, unparsed, _ = load_events(tmp_path)
+
+    assert sorted(q.item_id for q in unparsed) == [1, 2]
+
+
+# ------------------------ all-or-nothing publishing --------------------
+
+TABLES = {"purchases.csv": "a\r\n1\r\n", "purchase_intervals.csv": "b\r\n",
+          "quarantine.csv": "c\r\n"}
+
+
+def test_published_run_is_complete_and_found_through_the_pointer(tmp_path):
+    run_id = publish_run(tmp_path, TABLES)
+
+    folder = latest_clean_dir(tmp_path)
+
+    assert folder.name == run_id
+    assert {p.name for p in folder.iterdir()} == set(TABLES)
+    assert (folder / "purchases.csv").read_bytes() == b"a\r\n1\r\n"
+
+
+def test_same_content_gives_the_same_run_and_creates_nothing_new(tmp_path):
+    first = publish_run(tmp_path, TABLES)
+    second = publish_run(tmp_path, TABLES)
+
+    assert first == second
+    assert len(list((tmp_path / "runs").iterdir())) == 1
+
+
+def test_a_crash_before_the_commit_leaves_the_previous_run_untouched(tmp_path, monkeypatch):
+    old = publish_run(tmp_path, TABLES)
+    real_replace = transform.os.replace
+
+    def crash_at_the_pointer(source, destination):
+        if str(destination).endswith("_latest.json"):
+            raise OSError("simulated crash")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(transform.os, "replace", crash_at_the_pointer)
+    with pytest.raises(OSError):
+        publish_run(tmp_path, {**TABLES, "purchases.csv": "different\r\n"})
+    monkeypatch.undo()
+
+    folder = latest_clean_dir(tmp_path)
+    assert folder.name == old                                   # readers still see the old run
+    assert (folder / "purchases.csv").read_bytes() == b"a\r\n1\r\n"
+
+
+def test_leftover_staging_folders_are_removed_on_the_next_run(tmp_path):
+    (tmp_path / "runs" / ".tmp-deadbeef").mkdir(parents=True)
+
+    publish_run(tmp_path, TABLES)
+
+    assert not (tmp_path / "runs" / ".tmp-deadbeef").exists()
+
+
+def test_old_runs_are_pruned_but_the_current_one_stays(tmp_path):
+    ids = [publish_run(tmp_path, {**TABLES, "quarantine.csv": f"{n}\r\n"}) for n in range(8)]
+
+    remaining = {p.name for p in (tmp_path / "runs").iterdir()}
+
+    assert len(remaining) == transform.KEEP_RUNS
+    assert ids[-1] in remaining and latest_clean_dir(tmp_path).exists()
+
+
+def test_reading_before_any_run_explains_what_to_do(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Run the pipeline first"):
+        latest_clean_dir(tmp_path)

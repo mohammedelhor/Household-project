@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.db.models import Base
 from data_engineering.pipeline import run_pipeline
+from data_engineering.transform import latest_clean_dir
 from data_engineering.synthetic_data import (
     PRODUCT_PROFILES,
     build_ground_truth,
@@ -54,7 +55,7 @@ def test_whole_pipeline_reproduces_the_answer_key(engine, truth_path, tmp_path, 
     )
 
     assert code == 0
-    assert (tmp_path / "clean" / "purchase_intervals.csv").exists()
+    assert (latest_clean_dir(tmp_path / "clean") / "purchase_intervals.csv").exists()
     assert "OK" in capsys.readouterr().out
 
 
@@ -62,12 +63,13 @@ def test_second_run_changes_nothing(engine, truth_path, tmp_path):
     kwargs = dict(engine=engine, raw_dir=tmp_path / "raw",
                   clean_dir=tmp_path / "clean", truth_path=truth_path, now=NOW)
     run_pipeline(**kwargs)
-    first = (tmp_path / "clean" / "purchases.csv").read_text(encoding="utf-8")
+    first_run = latest_clean_dir(tmp_path / "clean").name
     batches = sorted(p.name for p in (tmp_path / "raw" / "item_events").glob("*.csv"))
 
     assert run_pipeline(**kwargs) == 0
 
-    assert (tmp_path / "clean" / "purchases.csv").read_text(encoding="utf-8") == first
+    assert latest_clean_dir(tmp_path / "clean").name == first_run   # same content, same run
+    assert len(list((tmp_path / "clean" / "runs").iterdir())) == 1
     assert sorted(p.name for p in (tmp_path / "raw" / "item_events").glob("*.csv")) == batches
 
 
