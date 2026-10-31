@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 import sys
@@ -107,18 +108,29 @@ def format_value(value) -> str:
     return str(value)
 
 
+def render_csv(columns: tuple[str, ...], rows) -> str:
+    """The exact text of a CSV file, built in memory.
+
+    Having this as its own function lets us compare "what we are about to
+    write" with "what is already on disk" before touching the disk.
+    """
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow([format_value(row[column]) for column in columns])
+    return buffer.getvalue()
+
+
 def write_csv_atomic(path: Path, columns: tuple[str, ...], rows) -> None:
     """Write a CSV under a temporary name, then rename it into place."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
 
-    # newline="" is required by the csv module; without it Windows would
-    # insert blank lines between rows.
+    # newline="" so the text is written exactly as rendered (no Windows
+    # translation of line endings, which would also break comparisons).
     with open(temporary, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(columns)
-        for row in rows:
-            writer.writerow([format_value(row[column]) for column in columns])
+        handle.write(render_csv(columns, rows))
 
     os.replace(temporary, path)  # atomic: readers see the old file or the new one
 
@@ -221,15 +233,30 @@ def extract_products_snapshot(
     out_dir: Path,
     *,
     now: datetime | None = None,
-) -> Path:
-    """Save ALL products. They are few and can be edited, so incremental
-    extraction would miss changes to rows we already copied."""
+) -> Path | None:
+    """Save ALL products, but only when they differ from the newest snapshot.
+
+    Products are few and can be edited, so incremental extraction would miss
+    changes to rows we already copied: we take the full table each time.
+    Writing a new file on every run, though, would pile up identical copies
+    forever. So we compare the content with the newest snapshot and write
+    only on a real change. Returns the new file, or None if nothing changed.
+    """
     now = _as_utc(now) if now else datetime.now(timezone.utc)
 
     table = Product.__table__
     query = select(*(table.c[name] for name in PRODUCT_COLUMNS)).order_by(table.c.id)
     with engine.connect() as connection:
         rows = connection.execute(query).mappings().all()
+
+    content = render_csv(PRODUCT_COLUMNS, rows)
+
+    # Names contain a sortable UTC timestamp, so the last name is the newest.
+    existing = sorted((out_dir / "products").glob("products_*.csv"))
+    if existing:
+        with open(existing[-1], newline="", encoding="utf-8") as handle:
+            if handle.read() == content:
+                return None
 
     path = out_dir / "products" / f"products_{now.strftime('%Y%m%dT%H%M%SZ')}.csv"
     write_csv_atomic(path, PRODUCT_COLUMNS, rows)
@@ -255,7 +282,10 @@ def run(
         print(f"item_events: wrote {events_path.name}")
     else:
         print("item_events: nothing new")
-    print(f"products:    wrote {products_path.name}")
+    if products_path:
+        print(f"products:    wrote {products_path.name}")
+    else:
+        print("products:    unchanged")
     return 0
 
 

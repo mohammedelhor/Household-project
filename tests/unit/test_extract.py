@@ -189,3 +189,44 @@ def test_products_snapshot_contains_every_product(engine, tmp_path):
     assert [r["name"] for r in rows] == ["Rice", "Milk"]
     assert rows[1]["default_unit"] == ""    # NULL becomes empty text: CSV's weakness
     assert rows[0]["is_active"] == "true"
+
+
+def _add_product(engine, product_id, name):
+    with Session(engine) as session:
+        session.add(Product(id=product_id, name=name, normalized_name=name.lower()))
+        session.commit()
+
+
+def test_unchanged_products_do_not_create_a_new_snapshot(engine, tmp_path):
+    _add_product(engine, 1, "Rice")
+    extract_products_snapshot(engine, tmp_path, now=NOW)
+
+    again = extract_products_snapshot(engine, tmp_path, now=NOW + timedelta(hours=1))
+
+    assert again is None
+    assert len(list((tmp_path / "products").glob("*.csv"))) == 1
+
+
+def test_a_changed_product_table_creates_a_new_snapshot(engine, tmp_path):
+    _add_product(engine, 1, "Rice")
+    extract_products_snapshot(engine, tmp_path, now=NOW)
+    _add_product(engine, 2, "Milk")
+
+    later = extract_products_snapshot(engine, tmp_path, now=NOW + timedelta(hours=1))
+
+    assert later is not None
+    assert [r["name"] for r in read_rows(later)] == ["Rice", "Milk"]
+    assert len(list((tmp_path / "products").glob("*.csv"))) == 2
+
+
+def test_an_edit_to_an_existing_product_is_captured(engine, tmp_path):
+    # The reason we snapshot the whole table: edits to old rows must not be missed.
+    _add_product(engine, 1, "Rice")
+    extract_products_snapshot(engine, tmp_path, now=NOW)
+    with Session(engine) as session:
+        session.get(Product, 1).category = "grains"
+        session.commit()
+
+    later = extract_products_snapshot(engine, tmp_path, now=NOW + timedelta(hours=1))
+
+    assert read_rows(later)[0]["category"] == "grains"
