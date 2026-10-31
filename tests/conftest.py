@@ -20,6 +20,18 @@ def test_engine():
         )
 
     url = make_url(database_url)
+    # Safety guard: these tests write and delete real rows. Refuse to run if
+    # TEST_DATABASE_URL points at the same database as the application
+    # (DATABASE_URL). In CI both are intentionally the same throwaway
+    # database, so the check is skipped there (GitHub sets CI=true).
+    app_url = os.getenv("DATABASE_URL")
+    if app_url and not os.getenv("CI"):
+        app = make_url(app_url)
+        if (app.host, app.database) == (url.host, url.database):
+            pytest.fail(
+                "TEST_DATABASE_URL points to the same database as "
+                "DATABASE_URL; refusing to run tests that write data."
+            )
 
     if url.get_backend_name() != "postgresql":
         pytest.fail("Model tests require PostgreSQL.")
