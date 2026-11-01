@@ -34,15 +34,19 @@ reference): revisit them when real data is long enough (see the report notes).
 
 from __future__ import annotations
 
+import json
+import os
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from data_engineering.transform import Event
 from ml.asof import events_as_of, purchases_as_of
 
 SOON_DAYS = 2
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -141,11 +145,65 @@ def suggest(events: list[Event], names: dict[int, str], *, as_of: datetime) -> l
     return suggestions
 
 
+# ---------------------------------------------------------------------------
+# Publishing for the API (the API never touches the database or the ML code)
+# ---------------------------------------------------------------------------
+#
+# The API only needs to READ a small file. This is the contract between the
+# two layers, so it is deliberately plain JSON with a version number:
+#
+#   {"schema_version": 1, "generated_at": ..., "as_of_date": ...,
+#    "dataset": {"run_id": ..., "input_fingerprint": ...},
+#    "suggestions": [{"product_id", "product_name", "last_purchase_date",
+#                     "typical_gap_days", "expected_date", "confidence",
+#                     "gaps_used"}, ...]}
+#
+# WHAT IS LEFT OUT ON PURPOSE: `status` and `days_until` change every day and
+# `already_on_list` changes whenever someone edits a list, so a file written
+# at 09:00 would be wrong by evening. The file keeps only what stays true
+# (the expected DATE); the API works out status and days from today's date.
+
+SERVING_SCHEMA_VERSION = 1
+DEFAULT_SERVING_PATH = PROJECT_ROOT / "data" / "serving" / "suggestions.json"
+
+
+def build_serving_payload(suggestions: list[Suggestion], *, run_id: str, fingerprint: str,
+                          generated_at: datetime) -> dict:
+    return {
+        "schema_version": SERVING_SCHEMA_VERSION,
+        "generated_at": generated_at.isoformat(),
+        "as_of_date": generated_at.astimezone(timezone.utc).date().isoformat(),
+        "dataset": {"run_id": run_id, "input_fingerprint": fingerprint},
+        "suggestions": [
+            {
+                "product_id": s.product_id,
+                "product_name": s.product_name,
+                "last_purchase_date": s.last_purchase_date.isoformat() if s.last_purchase_date else None,
+                "typical_gap_days": s.typical_gap_days,
+                "expected_date": s.expected_date.isoformat() if s.expected_date else None,
+                "confidence": s.confidence,
+                "gaps_used": s.gaps_used,
+            }
+            for s in suggestions
+        ],
+    }
+
+
+def write_serving_file(path: Path, payload: dict) -> None:
+    """Write atomically: the API reads this file while we may be replacing it,
+    and must see either the whole old file or the whole new one, never half."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)          # atomic on the same filesystem
+
+
 def main() -> int:
     """Print today's suggestions from the latest published data.
 
         uv run python -m ml.suggest
         uv run python -m ml.suggest --as-of 2026-10-20     # what it would have said then
+        uv run python -m ml.suggest --publish              # write the file the API serves
     """
     import argparse
     from pathlib import Path
@@ -158,7 +216,13 @@ def main() -> int:
     parser.add_argument("--raw-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--clean-dir", type=Path, default=DEFAULT_CLEAN_DIR)
     parser.add_argument("--as-of", type=date.fromisoformat, help="UTC date; default: now")
+    parser.add_argument("--publish", action="store_true", help="write the file the API serves")
+    parser.add_argument("--serving-path", type=Path, default=DEFAULT_SERVING_PATH)
     args = parser.parse_args()
+    if args.publish and args.as_of:
+        # A back-dated file would be served as if it were current.
+        print("--publish cannot be combined with --as-of")
+        return 1
 
     try:
         events, manifest, names = load_published_dataset(args.raw_dir, args.clean_dir)
@@ -169,13 +233,21 @@ def main() -> int:
     moment = (datetime.combine(args.as_of, datetime.max.time(), tzinfo=timezone.utc)
               if args.as_of else datetime.now(timezone.utc))
     print(f"dataset run: {manifest['run_id']}   as of: {moment.date()}\n")
+    results = suggest(events, names, as_of=moment)
     print(f"{'product':12} {'status':9} {'days':>5} {'expected':11} {'gap':>4} {'conf':7} note")
-    for s in suggest(events, names, as_of=moment):
+    for s in results:
         note = "already on a list" if s.already_on_list else ""
         print(f"{s.product_name:12} {s.status:9} "
               f"{'-' if s.days_until is None else format(s.days_until, '+d'):>5} "
               f"{str(s.expected_date or '-'):11} {s.typical_gap_days or '-':>4} "
               f"{s.confidence:7} {note}")
+
+    if args.publish:
+        payload = build_serving_payload(
+            results, run_id=manifest["run_id"],
+            fingerprint=manifest["inputs"]["fingerprint"], generated_at=moment)
+        write_serving_file(args.serving_path, payload)
+        print(f"\npublished for the API: {args.serving_path}")
     return 0
 
 

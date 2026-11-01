@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +18,14 @@ class Settings(BaseSettings):
         gt=0,
         le=60,
     )
+
+    # Where the data pipeline publishes the suggestions the API serves
+    # (written by `python -m ml.suggest --publish`). The API only reads this
+    # file: it never queries the data/ML layers or their sources.
+    suggestions_path: Path = PROJECT_ROOT / "data" / "serving" / "suggestions.json"
+    # After this many days without a new file the API still answers, but
+    # flags the answer as stale so a client can say so.
+    suggestions_stale_after_days: int = Field(default=7, gt=0)
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
