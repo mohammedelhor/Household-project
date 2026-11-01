@@ -1,8 +1,8 @@
-
 from fastapi import FastAPI
 from backend.app.api.routes.shopping import router as shopping_router
 from backend.app.api.routes.auth import router as auth_router
 from backend.app.api.routes.products import router as products_router
+from backend.app.api.routes.suggestions import router as suggestions_router
 
 app = FastAPI(
     title="Household Intelligence API",
@@ -25,6 +25,12 @@ app.include_router(
     products_router,
     prefix="/api/v1",
     tags=["Products"],
+)
+
+app.include_router(
+    suggestions_router,
+    prefix="/api/v1",
+    tags=["Suggestions"],
 )
 
 @app.get("/health")

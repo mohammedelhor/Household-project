@@ -155,3 +155,38 @@ def test_today_is_the_utc_date_of_as_of():
     late = datetime(2026, 9, 15, 23, 30, tzinfo=timezone.utc)
     s = by_name(suggest(log.events, NAMES, as_of=late))["Milk"]
     assert s.days_until == 1 and s.expected_date == date(2026, 9, 16)
+
+
+# ------------------------- the file the API serves ----------------------------
+
+def test_serving_payload_has_the_documented_shape_and_no_daily_fields(tmp_path):
+    import json
+    from ml.suggest import SERVING_SCHEMA_VERSION, build_serving_payload, write_serving_file
+
+    log = Log()
+    for n in (0, 5, 10):
+        log.bought(1, n)
+    result = suggest(log.events, NAMES, as_of=day(12))
+    payload = build_serving_payload(result, run_id="abc123", fingerprint="f" * 64,
+                                    generated_at=day(12))
+
+    assert payload["schema_version"] == SERVING_SCHEMA_VERSION == 1
+    assert payload["dataset"] == {"run_id": "abc123", "input_fingerprint": "f" * 64}
+    milk = next(s for s in payload["suggestions"] if s["product_name"] == "Milk")
+    assert milk["expected_date"] == day(15).date().isoformat()
+    assert milk["typical_gap_days"] == 5 and milk["confidence"] == "low"      # 2 gaps
+    # what changes every day (or with every list edit) must NOT be stored
+    assert not {"status", "days_until", "already_on_list"} & set(milk)
+
+    path = tmp_path / "serving" / "suggestions.json"      # parent folder does not exist yet
+    write_serving_file(path, payload)
+    assert json.loads(path.read_text(encoding="utf-8")) == payload
+    assert not list(path.parent.glob("*.tmp"))             # no temp file left behind
+
+
+def test_writing_again_replaces_the_file(tmp_path):
+    from ml.suggest import write_serving_file
+    path = tmp_path / "s.json"
+    write_serving_file(path, {"a": 1})
+    write_serving_file(path, {"a": 2})
+    assert path.read_text(encoding="utf-8").count('"a": 2') == 1
