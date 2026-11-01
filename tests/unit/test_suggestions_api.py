@@ -10,10 +10,19 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
 from backend.app.api.routes.auth import get_current_user
 from backend.app.api.routes.suggestions import get_now
 from backend.app.core.config import settings
+from backend.app.db.database import get_db
+from backend.app.db.models import (
+    Base, Household, HouseholdMember, Product, ShoppingList, ShoppingListItem, User,
+)
 from backend.app.main import app
+from backend.app.services.suggestion_lists import products_waiting_on_lists
 from backend.app.services import suggestions as service
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)      # today = Nov 1
@@ -34,11 +43,36 @@ def file_payload(*entries, generated_at=NOW, schema_version=1):
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def db():
+    engine = create_engine("sqlite+pysqlite:///:memory:",
+                           connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)()
+    yield session
+    session.close()
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+
+
+def make_user(db, email):
+    user = User(email=email, password_hash="x")
+    db.add(user)
+    db.commit()
+    return user
+
+
+@pytest.fixture
+def me(db):
+    return make_user(db, "me@example.com")
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch, db, me):
     path = tmp_path / "suggestions.json"
     monkeypatch.setattr(settings, "suggestions_path", path)
     previous = app.dependency_overrides.copy()
-    app.dependency_overrides[get_current_user] = lambda: object()   # any logged-in user
+    app.dependency_overrides[get_current_user] = lambda: me
+    app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_now] = lambda: NOW
     try:
         yield TestClient(app), path
@@ -156,3 +190,121 @@ def test_service_does_not_import_the_ml_or_data_layers():
                 for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
                 for a in (n.names if isinstance(n, ast.Import) else [n])}
     assert not imported & {"ml", "data_engineering"}
+
+
+# ---------------------- "already on a list" (the user's live lists) ---------------
+
+def personal_list(db, user, archived=False):
+    shopping_list = ShoppingList(owner_user_id=user.id, name="Mine",
+                                 archived_at=NOW if archived else None)
+    db.add(shopping_list)
+    db.commit()
+    return shopping_list
+
+
+def add_item(db, shopping_list, product_id, *, status="needed", archived=False):
+    product = db.get(Product, product_id) or Product(
+        id=product_id, name=f"P{product_id}", normalized_name=f"p{product_id}")
+    db.merge(product)
+    item = ShoppingListItem(
+        list_id=shopping_list.id, product_id=product_id, product_name=f"P{product_id}",
+        quantity=1, unit="piece", status=status, archived_at=NOW if archived else None)
+    db.add(item)
+    db.commit()
+    return item
+
+
+def test_a_needed_item_marks_the_suggestion(client, db, me):
+    http, path = client
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02"), entry(2, "Rice", "2026-11-05")))
+    mine = personal_list(db, me)
+    add_item(db, mine, 1)
+
+    got = {s["product_name"]: s for s in http.get("/api/v1/suggestions").json()["suggestions"]}
+    assert got["Milk"]["already_on_list"] is True and got["Milk"]["on_list_id"] == mine.id
+    assert got["Rice"]["already_on_list"] is False and got["Rice"]["on_list_id"] is None
+
+
+def test_a_purchased_or_archived_item_does_not_count(client, db, me):
+    http, path = client
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02"), entry(2, "Rice", "2026-11-03")))
+    mine = personal_list(db, me)
+    add_item(db, mine, 1, status="purchased")
+    add_item(db, mine, 2, archived=True)
+
+    flags = [s["already_on_list"] for s in http.get("/api/v1/suggestions").json()["suggestions"]]
+    assert flags == [False, False]
+
+
+def test_an_item_on_an_archived_list_does_not_count(client, db, me):
+    http, path = client
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02")))
+    add_item(db, personal_list(db, me, archived=True), 1)
+    assert http.get("/api/v1/suggestions").json()["suggestions"][0]["already_on_list"] is False
+
+
+def test_another_users_personal_list_is_never_visible(client, db, me):
+    http, path = client
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02")))
+    other = make_user(db, "other@example.com")
+    add_item(db, personal_list(db, other), 1)
+    assert http.get("/api/v1/suggestions").json()["suggestions"][0]["already_on_list"] is False
+
+
+def test_a_household_list_counts_only_for_members(client, db, me):
+    http, path = client
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02")))
+    other, stranger = make_user(db, "other@example.com"), make_user(db, "stranger@example.com")
+    family, strangers = Household(name="Family"), Household(name="Strangers")
+    db.add_all([family, strangers])
+    db.commit()
+    db.add_all([HouseholdMember(household_id=family.id, user_id=me.id, role="member"),
+                HouseholdMember(household_id=family.id, user_id=other.id, role="owner"),
+                HouseholdMember(household_id=strangers.id, user_id=stranger.id, role="owner")])
+    shared = ShoppingList(household_id=family.id, name="Shared")
+    private_to_others = ShoppingList(household_id=strangers.id, name="Others")
+    db.add_all([shared, private_to_others])
+    db.commit()
+
+    add_item(db, private_to_others, 1)                       # not my household
+    assert http.get("/api/v1/suggestions").json()["suggestions"][0]["already_on_list"] is False
+
+    add_item(db, shared, 1)                                  # my household's list
+    s = http.get("/api/v1/suggestions").json()["suggestions"][0]
+    assert s["already_on_list"] is True and s["on_list_id"] == shared.id
+
+
+def test_free_text_items_are_ignored_and_the_oldest_item_picks_the_list(db, me):
+    first, second = personal_list(db, me), None
+    free = ShoppingListItem(list_id=first.id, product_id=None, product_name="Milk",
+                            quantity=1, unit="piece", status="needed")
+    db.add(free)
+    db.commit()
+    assert products_waiting_on_lists(db, me.id) == {}        # no product, no match
+
+    household = Household(name="Family")
+    db.add(household)
+    db.commit()
+    db.add(HouseholdMember(household_id=household.id, user_id=me.id, role="member"))
+    second = ShoppingList(household_id=household.id, name="Shared")
+    db.add(second)
+    db.commit()
+    add_item(db, second, 1)                                  # older item: shared list
+    add_item(db, first, 1)                                   # newer item: personal list
+    assert products_waiting_on_lists(db, me.id) == {1: second.id}
+
+
+def test_missing_file_is_still_503_even_with_lists(client, db, me):
+    http, _ = client
+    add_item(db, personal_list(db, me), 1)
+    assert http.get("/api/v1/suggestions").status_code == 503
+
+
+def test_the_list_lookup_does_not_import_the_ml_or_data_layers():
+    import ast
+    import inspect
+    from backend.app.services import suggestion_lists
+    tree = ast.parse(inspect.getsource(suggestion_lists))
+    modules = {n.module.split(".")[0] for n in ast.walk(tree)
+               if isinstance(n, ast.ImportFrom) and n.module}
+    assert not modules & {"ml", "data_engineering"}

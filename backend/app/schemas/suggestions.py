@@ -19,6 +19,9 @@ class SuggestionRead(BaseModel):
     status: Status                  # worked out from TODAY
     confidence: Confidence
     gaps_used: int
+    # Worked out from the user's CURRENT lists (not from the published file):
+    already_on_list: bool = False   # an item of this product is waiting to be bought
+    on_list_id: int | None = None   # the list it is on (the oldest such item's list)
 
 
 class SuggestionsRead(BaseModel):

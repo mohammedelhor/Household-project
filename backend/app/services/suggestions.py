@@ -9,6 +9,9 @@ even if the ML layer is rewritten, as long as the file keeps its shape.
 
 WHAT IS WORKED OUT HERE
 -----------------------
+`waiting` (product id -> list id) comes from the caller: it describes the
+user's current lists, which change all day, so it is never read from the file.
+
 The file holds the stable facts (expected DATE, typical gap, confidence).
 `days_until` and `status` depend on today, so they are computed per request.
 The rule below intentionally repeats ml.suggest.status_for (a tiny function is
@@ -65,6 +68,7 @@ def load_suggestions(
     today: date,
     now: datetime,
     stale_after_days: int,
+    waiting: dict[int, int] | None = None,
 ) -> SuggestionsRead:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -78,6 +82,7 @@ def load_suggestions(
             f"unsupported schema_version {parsed.schema_version}"
         )
 
+    waiting = waiting or {}
     items: list[SuggestionRead] = []
     for entry in parsed.suggestions:
         if entry.expected_date is None:
@@ -87,6 +92,8 @@ def load_suggestions(
             status = status_for(days_until)
         items.append(SuggestionRead(
             **entry.model_dump(), days_until=days_until, status=status,
+            already_on_list=entry.product_id in waiting,
+            on_list_id=waiting.get(entry.product_id),
         ))
 
     # Most urgent first (most overdue = smallest days_until); unknown last.
