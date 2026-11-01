@@ -31,7 +31,7 @@ Unique: `item_id`, `source_event_id`.
 
 ## purchase_intervals.csv
 
-Days between consecutive purchases of the same product (items with no catalog product are skipped).
+Days between consecutive purchases of the same product (items with no catalog product are skipped). Rows are grouped by product and, inside a product, ordered by time. The quality gate recomputes every row from purchases.csv and rejects any difference.
 
 | column | type | required | rules | meaning |
 |---|---|---|---|---|

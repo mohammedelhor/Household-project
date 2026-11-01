@@ -95,13 +95,79 @@ def test_intervals_that_do_not_follow_from_the_purchases_fail():
 
     report = gate(tables(intervals=[wrong]))
 
-    assert "intervals can be derived from the purchases" in failed_names(report)
+    assert "every interval matches the one derived from the purchases" in failed_names(report)
+
+
+# -- the example from the review: purchases on Oct 1, Oct 2 and Oct 5 --------
+
+def _three_purchases():
+    return [purchase(1, 1), purchase(2, 2), purchase(3, 5)]
+
+
+def _interval_row(first, second, days):
+    return {"product_id": 1, "product_name": "Rice",
+            "previous_purchase_date": f"2026-10-{first:02d}",
+            "purchase_date": f"2026-10-{second:02d}", "days_since_previous": days}
+
+
+def test_correct_intervals_of_the_review_example_pass():
+    correct = [_interval_row(1, 2, 1), _interval_row(2, 5, 3)]
+
+    assert gate(tables(_three_purchases(), correct)).status == "PASS"
+
+
+@pytest.mark.parametrize("wrong", [
+    # right dates, wrong days (1 and 3 became 2 and 2)
+    [_interval_row(1, 2, 2), _interval_row(2, 5, 2)],
+    # days that agree with the rows' own dates, but the dates are not the purchases'
+    [_interval_row(1, 3, 2), _interval_row(3, 5, 2)],
+])
+def test_wrong_intervals_are_rejected_even_when_count_and_total_days_are_right(wrong):
+    # The weaker checks of the first version would have accepted these: two
+    # intervals (the right count) adding up to 4 days (the span Oct 1 -> Oct 5).
+    assert len(wrong) == 2 and sum(r["days_since_previous"] for r in wrong) == 4
+
+    report = gate(tables(_three_purchases(), wrong))
+
+    assert report.status == "FAIL"
+    assert failed_names(report) == ["every interval matches the one derived from the purchases"]
+    assert "interval #" in report.failures[0].detail
+
+
+def test_intervals_in_the_wrong_order_are_rejected():
+    swapped = [_interval_row(2, 5, 3), _interval_row(1, 2, 1)]
+
+    assert gate(tables(_three_purchases(), swapped)).status == "FAIL"
+
+
+def test_an_extra_interval_is_rejected():
+    extra = [_interval_row(1, 2, 1), _interval_row(2, 5, 3), _interval_row(5, 9, 4)]
+
+    assert gate(tables(_three_purchases(), extra)).status == "FAIL"
+
+
+def test_an_interval_for_a_product_without_purchases_is_rejected():
+    stray = {**interval(1, 15), "product_id": 2}
+
+    assert gate(tables(intervals=[interval(1, 15), stray]), known_product_ids={1, 2}).status == "FAIL"
+
+
+def test_the_gate_derives_intervals_per_product_and_in_time_order():
+    from data_engineering.quality_gate import derive_intervals
+    rows = [purchase(1, 9), purchase(2, 1), purchase(3, 4, product_id=2, product_name="Milk"),
+            purchase(4, 20, product_id=2, product_name="Milk")]
+    rows = [{**r, "product_id": str(r["product_id"])} for r in rows]   # as read from CSV
+
+    assert derive_intervals(rows) == {
+        1: [("2026-10-01", "2026-10-09", 8)],
+        2: [("2026-10-04", "2026-10-20", 16)],
+    }
 
 
 def test_missing_intervals_fail():
     report = gate(tables(intervals=[]))
 
-    assert "intervals can be derived from the purchases" in failed_names(report)
+    assert "every interval matches the one derived from the purchases" in failed_names(report)
 
 
 def test_a_purchase_in_the_future_fails():

@@ -61,11 +61,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from backend.app.core.units import SUPPORTED_UNITS
+import data_engineering.contracts as contracts_module
 from data_engineering.contracts import CONTRACT_VERSION
 from data_engineering.extract import DEFAULT_OUT_DIR as DEFAULT_RAW_DIR
 from data_engineering.extract import EVENT_COLUMNS, PRODUCT_COLUMNS, render_csv
 from data_engineering.lineage import (
     build_manifest,
+    code_fingerprint,
     describe_inputs,
     git_state,
     read_previous_purchase_count,
@@ -81,6 +83,9 @@ EVENT_TYPES = frozenset({"added", "purchased", "reverted", "archived"})
 # a purchase, what gets quarantined), so two runs made with different logic
 # can never be mistaken for each other.
 TRANSFORM_VERSION = "1.0.0"
+# The source files that decide what the results are. Their content is part of
+# every run's identity (see `logic_identity`).
+CODE_FILES = (Path(__file__), Path(contracts_module.__file__))
 RULES = (
     "R1 each event is valid on its own (type, positive quantity, supported unit)",
     "R2 all events of an item agree on list, product, quantity and unit",
@@ -489,10 +494,13 @@ def compare_with_truth(summary: dict[str, dict], truth: dict) -> list[dict]:
 # (the folder stays, so a person can open quality_report.json and see why) but
 # NOT step 3: the pointer keeps naming the last run that passed.
 #
-# The run id is a hash of the data tables plus the fingerprint of the raw
-# inputs, so re-running on unchanged data produces the same id and creates
-# nothing new. The metadata files (manifest, report) are NOT part of the hash:
-# they contain timestamps and would make every run look different.
+# The run id is a hash of the data tables, the fingerprint of the raw inputs
+# and the identity of the logic (versions + source hash). Re-running on the
+# same inputs with the same logic produces the same id and creates nothing
+# new; changing the logic creates a NEW run even if the numbers come out
+# identical, so a folder never carries the manifest of different code. The
+# metadata files (manifest, report) are NOT part of the hash: they contain
+# timestamps and would make every run look different.
 
 RUNS_DIR = "runs"
 POINTER_FILE = "_latest.json"
@@ -500,8 +508,18 @@ KEEP_RUNS = 5   # the current run plus the most recent older ones
 REFRESHED_EXTRAS = ("quality_report.json",)   # rewritten even for an existing run
 
 
-def compute_run_id(tables: dict[str, str], fingerprint: str = "") -> str:
-    digest = hashlib.sha256(fingerprint.encode("utf-8") + b"\0")
+def logic_identity() -> str:
+    """Which logic produced the results: the declared versions AND a hash of
+    the source files. A run is reused only when the INPUTS, the OUTPUTS and
+    this logic are all identical, so a reused folder never carries the
+    manifest of different code. (The git commit is deliberately NOT part of
+    the identity: an unrelated commit must not create a new run. It is
+    recorded per execution in publish_log.jsonl instead.)"""
+    return f"{TRANSFORM_VERSION}|{CONTRACT_VERSION}|{code_fingerprint(list(CODE_FILES))}"
+
+
+def compute_run_id(tables: dict[str, str], fingerprint: str = "", logic: str = "") -> str:
+    digest = hashlib.sha256(fingerprint.encode("utf-8") + b"\0" + logic.encode("utf-8") + b"\0")
     for name in sorted(tables):
         digest.update(name.encode("utf-8") + b"\0")
         digest.update(tables[name].encode("utf-8") + b"\0")
@@ -519,12 +537,13 @@ def publish_run(
     *,
     extras: dict[str, str] | None = None,
     fingerprint: str = "",
+    logic: str = "",
     commit: bool = True,
 ) -> str:
     """Write one run folder; move the pointer to it only if `commit` is True.
     Returns the run id."""
     extras = extras or {}
-    run_id = compute_run_id(tables, fingerprint)
+    run_id = compute_run_id(tables, fingerprint, logic)
 
     runs = out_dir / RUNS_DIR
     runs.mkdir(parents=True, exist_ok=True)
@@ -570,6 +589,19 @@ def publish_run(
     for old in older[max(KEEP_RUNS - len(protected), 0):]:
         shutil.rmtree(old, ignore_errors=True)
     return run_id
+
+
+PUBLISH_LOG = "publish_log.jsonl"
+
+
+def append_publish_log(out_dir: Path, entry: dict) -> None:
+    """One line per EXECUTION: when, which run, the gate verdict, whether it
+    was published, and which code state ran. A reused run folder keeps its
+    original manifest, so this is where "who published it this time, with
+    which commit" lives."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / PUBLISH_LOG, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
 
 
 def latest_clean_dir(out_dir: Path) -> Path:
@@ -637,7 +669,9 @@ def run(
 
     # Lineage: exactly which raw bytes and which code produced this run.
     inputs = describe_inputs(raw_dir)
-    run_id = compute_run_id(tables, inputs["fingerprint"])
+    logic = logic_identity()
+    run_id = compute_run_id(tables, inputs["fingerprint"], logic)
+    code = {**git_state(PROJECT_ROOT), "source_fingerprint": logic.split("|")[-1]}
     manifest = build_manifest(
         run_id=run_id, created_at=now, inputs=inputs,
         counts={
@@ -649,7 +683,7 @@ def run(
             "intervals": len(intervals),
         },
         rules=RULES, transform_version=TRANSFORM_VERSION,
-        contract_version=CONTRACT_VERSION, code=git_state(PROJECT_ROOT),
+        contract_version=CONTRACT_VERSION, code=code,
     )
 
     # The gate: a verdict, not just a report.
@@ -669,8 +703,13 @@ def run(
             "quality_report.json": json.dumps(report.to_dict(), indent=2),
         },
         fingerprint=inputs["fingerprint"],
+        logic=logic,
         commit=report.passed,
     )
+    append_publish_log(out_dir, {
+        "at": now.isoformat(), "run_id": run_id, "gate": report.status,
+        "published": report.passed, "code": code,
+    })
 
     problem = not report.passed
     run_path = out_dir / RUNS_DIR / run_id

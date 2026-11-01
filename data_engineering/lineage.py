@@ -70,6 +70,21 @@ def describe_inputs(raw_dir: Path) -> dict:
     return {"fingerprint": combined, "event_files": event_files, "products_snapshot": products}
 
 
+def code_fingerprint(paths: list[Path]) -> str:
+    """A hash of the SOURCE of the files that decide what the results are.
+
+    Version constants rely on someone remembering to bump them; this does not.
+    Line endings are normalised first, because the same file is "\r\n" on
+    one Windows checkout and "\n" on another (git autocrlf), and that must not
+    change the identity of the code.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda p: p.name):
+        digest.update(path.name.encode("utf-8") + b"\0")
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    return digest.hexdigest()[:16]
+
+
 def git_state(project_root: Path) -> dict:
     """Which code produced this? The commit, and whether files had
     uncommitted changes (then the commit alone does not identify the code)."""

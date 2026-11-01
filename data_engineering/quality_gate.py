@@ -93,6 +93,30 @@ def _rows(csv_text: str) -> list[dict[str, str]]:
     return list(csv.DictReader(io.StringIO(csv_text, newline="")))
 
 
+def derive_intervals(purchases: list[dict[str, str]]) -> dict[int, list[tuple[str, str, int]]]:
+    """Recompute, independently of the cleaning code, the intervals that the
+    purchases imply: per product, in time order, (previous date, date, days)
+    for every pair of consecutive purchases. Items with no product are skipped.
+
+    This is deliberately a second implementation (it works from the published
+    CSV text), so a bug in transform.compute_intervals cannot vouch for itself.
+    """
+    by_product: dict[int, list[tuple[str, int, date]]] = defaultdict(list)
+    for r in purchases:
+        if r["product_id"]:
+            by_product[int(r["product_id"])].append(
+                (r["purchased_at"], int(r["item_id"]), date.fromisoformat(r["purchase_date"]))
+            )
+    derived: dict[int, list[tuple[str, str, int]]] = {}
+    for product, rows in by_product.items():
+        rows.sort(key=lambda row: (datetime.fromisoformat(row[0]), row[1]))   # time, then item
+        derived[product] = [
+            (before[2].isoformat(), after[2].isoformat(), (after[2] - before[2]).days)
+            for before, after in zip(rows, rows[1:])
+        ]
+    return {product: pairs for product, pairs in derived.items() if pairs}
+
+
 def run_gate(
     tables: dict[str, str],
     *,
@@ -140,26 +164,30 @@ def run_gate(
     add("every purchase's product exists in the products snapshot", "critical", not unknown,
         f"unknown product ids: {unknown[:5]}")
 
-    # Intervals must be derivable from the purchases: for each product,
-    # (number of purchases - 1) intervals, and their days must add up to the
-    # span between the first and last purchase date.
-    dates: dict[int, list[date]] = defaultdict(list)
-    for r in purchases:
-        if r["product_id"]:
-            dates[int(r["product_id"])].append(date.fromisoformat(r["purchase_date"]))
-    interval_count: dict[int, int] = defaultdict(int)
-    interval_days: dict[int, int] = defaultdict(int)
+    # Every interval must be the one that follows from the purchases, RECORD
+    # BY RECORD. Checking only the count and the total number of days is not
+    # enough: purchases on Oct 1, 2 and 5 give intervals of 1 and 3 days, but
+    # two wrong intervals of 2 and 2 days have the same count (2) and the same
+    # total (4). So we derive every interval again and compare them one by one.
+    expected = derive_intervals(purchases)
+    found: dict[int, list[tuple[str, str, int]]] = defaultdict(list)
     for r in intervals:
-        interval_count[int(r["product_id"])] += 1
-        interval_days[int(r["product_id"])] += int(r["days_since_previous"])
-    inconsistent = [
-        product for product in set(dates) | set(interval_count)
-        if interval_count[product] != max(len(dates.get(product, [])) - 1, 0)
-        or interval_days[product] != ((max(dates[product]) - min(dates[product])).days
-                                      if dates.get(product) else 0)
-    ]
-    add("intervals can be derived from the purchases", "critical", not inconsistent,
-        f"inconsistent products: {sorted(inconsistent)[:5]}")
+        found[int(r["product_id"])].append(
+            (r["previous_purchase_date"], r["purchase_date"], int(r["days_since_previous"]))
+        )
+    wrong = []
+    for product in sorted(set(expected) | set(found)):
+        want, have = expected.get(product, []), found.get(product, [])
+        if want != have:
+            position = next((i for i, (a, b) in enumerate(zip(want, have)) if a != b),
+                            min(len(want), len(have)))
+            wrong.append(
+                f"product {product}, interval #{position + 1}: expected "
+                f"{want[position] if position < len(want) else 'none'}, found "
+                f"{have[position] if position < len(have) else 'none'}"
+            )
+    add("every interval matches the one derived from the purchases", "critical", not wrong,
+        f"{len(wrong)} product(s) differ; " + " | ".join(wrong[:3]))
 
     # ---- 4. time sanity
     future = [r["item_id"] for r in purchases

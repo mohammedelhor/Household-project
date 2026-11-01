@@ -73,3 +73,18 @@ def test_a_resaved_products_snapshot_with_the_same_rows_is_the_same_input(tmp_pa
     (tmp_path / "products" / "products_20261105T000000Z.csv").write_bytes(source.read_bytes())
 
     assert describe_inputs(tmp_path)["fingerprint"] == before
+
+
+# ------------------------------- code identity -------------------------------
+
+def test_code_fingerprint_changes_with_the_code_but_not_with_line_endings(tmp_path):
+    from data_engineering.lineage import code_fingerprint
+    source = tmp_path / "logic.py"
+    source.write_bytes(b"x = 1\nprint(x)\n")
+    base = code_fingerprint([source])
+
+    source.write_bytes(b"x = 1\r\nprint(x)\r\n")          # same code, Windows line endings
+    assert code_fingerprint([source]) == base
+
+    source.write_bytes(b"x = 2\nprint(x)\n")              # different code
+    assert code_fingerprint([source]) != base

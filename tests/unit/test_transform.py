@@ -674,3 +674,72 @@ def test_a_file_with_the_wrong_columns_stops_the_run_with_a_clear_message(tmp_pa
     out = capsys.readouterr().out
     assert code == 1 and "RAW DATA ERROR" in out and name in out
     assert latest_clean_dir(clean).name == published
+
+
+# ------------------- run identity includes the logic --------------------
+
+def test_changed_logic_creates_a_new_run_even_when_the_numbers_are_identical(tmp_path, monkeypatch):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    first = latest_clean_dir(clean)
+    first_manifest = (first / "manifest.json").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(transform, "TRANSFORM_VERSION", "9.9.9")   # a rule changed, output did not
+    transform.run(raw, clean, now=NOW_AFTER)
+    second = latest_clean_dir(clean)
+
+    assert second.name != first.name
+    assert (second / "purchases.csv").read_bytes() == (first / "purchases.csv").read_bytes()
+    assert json.loads((second / "manifest.json").read_text(encoding="utf-8"))["transform_version"] == "9.9.9"
+    assert (first / "manifest.json").read_text(encoding="utf-8") == first_manifest   # old run untouched
+
+
+def test_a_change_in_the_source_code_changes_the_run_identity(tmp_path, monkeypatch):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    first = latest_clean_dir(clean).name
+
+    edited = tmp_path / "transform_copy.py"
+    edited.write_text("# a different version of the logic\n", encoding="utf-8")
+    monkeypatch.setattr(transform, "CODE_FILES", (edited,))
+    transform.run(raw, clean, now=NOW_AFTER)
+
+    assert latest_clean_dir(clean).name != first
+
+
+def test_same_logic_and_inputs_reuse_the_run_and_its_manifest(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    folder = latest_clean_dir(clean)
+    manifest = (folder / "manifest.json").read_text(encoding="utf-8")
+
+    transform.run(raw, clean, now=NOW_AFTER + timedelta(days=1))
+
+    assert latest_clean_dir(clean) == folder
+    assert (folder / "manifest.json").read_text(encoding="utf-8") == manifest
+
+
+def test_every_execution_is_logged_with_its_code_state(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    transform.run(raw, clean, now=NOW_AFTER + timedelta(days=1))   # reuses the folder
+
+    lines = [json.loads(line) for line in
+             (clean / "publish_log.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert [e["published"] for e in lines] == [True, True]
+    assert lines[0]["run_id"] == lines[1]["run_id"]
+    assert lines[0]["at"] != lines[1]["at"]
+    assert {"commit", "uncommitted_changes", "source_fingerprint"} <= set(lines[0]["code"])
+
+
+def test_a_rejected_execution_is_logged_as_not_published(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    write_csv_atomic(raw / "products" / "products_29991231T000000Z.csv", PRODUCT_COLUMNS,
+                     _products_rows(skip="Rice"))
+
+    transform.run(raw, clean, now=NOW_AFTER)
+
+    last = json.loads((clean / "publish_log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert last["gate"] == "FAIL" and last["published"] is False

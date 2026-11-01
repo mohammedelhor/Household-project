@@ -117,7 +117,9 @@ PURCHASE_INTERVALS = TableContract(
     file="purchase_intervals.csv",
     description=(
         "Days between consecutive purchases of the same product (items with "
-        "no catalog product are skipped)."
+        "no catalog product are skipped). Rows are grouped by product and, "
+        "inside a product, ordered by time. The quality gate recomputes every "
+        "row from purchases.csv and rejects any difference."
     ),
     columns=(
         Column("product_id", "int", "Catalog product."),
