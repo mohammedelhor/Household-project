@@ -16,12 +16,14 @@ from backend.app.db.models import Base, ItemEvent, Product
 from sqlalchemy import delete
 
 from data_engineering.extract import (
+    EVENT_COLUMNS,
     extract_item_events,
     extract_products_snapshot,
     read_extracted_ids,
     reconcile_item_events,
     run,
     take_stable_prefix,
+    write_csv_atomic,
 )
 
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
@@ -270,6 +272,26 @@ def test_reconciling_again_does_nothing(engine, tmp_path):
 
     assert again.recovered == 0 and again.late_file is None
     assert sorted(p.name for p in (tmp_path / "item_events").glob("*.csv")) == files_before
+
+
+def test_equal_counts_with_different_ids_are_still_detected(engine, tmp_path):
+    # Source holds {1, 3}; our files hold {1, 2}. Both have two ids, so a
+    # comparison of counts sees nothing, yet 3 is missing and 2 has vanished.
+    for event_id in (1, 2, 3):
+        add_event(engine, event_id)
+    extract_item_events(engine, tmp_path, now=NOW)
+    # Row 3 "arrives late" from our point of view: pretend we never got it...
+    batch = next((tmp_path / "item_events").glob("*.csv"))
+    rows = [r for r in read_rows(batch) if r["id"] != "3"]
+    write_csv_atomic(batch, EVENT_COLUMNS, rows)
+    # ...and row 2 is deleted at the source.
+    with engine.begin() as connection:
+        connection.execute(delete(ItemEvent).where(ItemEvent.id == 2))
+
+    result = reconcile_item_events(engine, tmp_path, now=NOW)
+
+    assert result.recovered == 1 and result.vanished == 1
+    assert [r["id"] for r in read_rows(result.late_file)] == ["3"]
 
 
 def test_no_gap_means_no_late_file(engine, tmp_path):

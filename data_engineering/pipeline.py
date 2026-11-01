@@ -61,7 +61,7 @@ def run_pipeline(
         return 1
 
     print("\n== step 2/2: clean ==")
-    code = transform.run(raw_dir, clean_dir, truth_path)
+    code = transform.run(raw_dir, clean_dir, truth_path, now=now)
     if code != 0:
         print("\nCLEAN step reported a problem.")
         return code

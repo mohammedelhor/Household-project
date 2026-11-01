@@ -61,13 +61,34 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from backend.app.core.units import SUPPORTED_UNITS
+from data_engineering.contracts import CONTRACT_VERSION
 from data_engineering.extract import DEFAULT_OUT_DIR as DEFAULT_RAW_DIR
-from data_engineering.extract import render_csv
+from data_engineering.extract import EVENT_COLUMNS, PRODUCT_COLUMNS, render_csv
+from data_engineering.lineage import (
+    build_manifest,
+    describe_inputs,
+    git_state,
+    read_previous_purchase_count,
+)
+from data_engineering.quality_gate import run_gate
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLEAN_DIR = PROJECT_ROOT / "data" / "clean"
 
 EVENT_TYPES = frozenset({"added", "purchased", "reverted", "archived"})
+
+# Recorded in every run's manifest. Bump it when a RULE changes (what counts as
+# a purchase, what gets quarantined), so two runs made with different logic
+# can never be mistaken for each other.
+TRANSFORM_VERSION = "1.0.0"
+RULES = (
+    "R1 each event is valid on its own (type, positive quantity, supported unit)",
+    "R2 all events of an item agree on list, product, quantity and unit",
+    "R3 the item's state sequence is possible (added first, no purchase twice in a row, nothing after archived)",
+    "R4 a repeated event id must be an identical copy, otherwise both items are rejected",
+    "R5 an item is a purchase only if it is still bought at the end of its history",
+    "R6 an inconsistent item is rejected as a whole",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +116,7 @@ class Purchase:
     quantity: Decimal
     unit: str
     purchased_at: datetime
+    source_event_id: int   # the 'purchased' event that created this row (lineage)
 
     @property
     def purchase_date(self) -> date:
@@ -150,6 +172,26 @@ def validate_event(event: Event) -> str | None:
     return None
 
 
+class RawDataError(Exception):
+    """A raw file cannot be read at all (wrong or missing columns). Unlike a
+    bad ROW, which is quarantined, a bad FILE means the extraction or the
+    source changed shape, so the run stops with a clear message."""
+
+
+def _check_header(path: Path, found: list[str] | None, expected: tuple[str, ...]) -> None:
+    if list(found or []) != list(expected):
+        raise RawDataError(
+            f"{path.name}: expected columns {list(expected)}, found {list(found or [])}"
+        )
+
+
+# Raw files are opened as "utf-8-sig": identical to utf-8, except that it also
+# accepts a leading byte-order mark (BOM). Our own writer never adds one, but
+# Windows tools (Excel, PowerShell 5 "Set-Content -Encoding utf8") do, and an
+# invisible BOM glued to the first column name ("\ufeffid") is a nasty bug.
+RAW_ENCODING = "utf-8-sig"
+
+
 def load_events(raw_dir: Path) -> tuple[list[Event], list[Quarantined], dict]:
     """Read every batch file. Returns (valid-looking events, rows that could
     not even be parsed, statistics)."""
@@ -160,8 +202,10 @@ def load_events(raw_dir: Path) -> tuple[list[Event], list[Quarantined], dict]:
 
     for path in sorted((raw_dir / "item_events").glob("item_events_*.csv")):
         stats["files"] += 1
-        with open(path, newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
+        with open(path, newline="", encoding=RAW_ENCODING) as handle:
+            reader = csv.DictReader(handle)
+            _check_header(path, reader.fieldnames, EVENT_COLUMNS)
+            for row in reader:
                 stats["rows_read"] += 1
                 try:
                     event = parse_event(row)
@@ -210,11 +254,13 @@ def load_product_names(raw_dir: Path) -> dict[int, tuple[str, str]]:
     snapshots = sorted((raw_dir / "products").glob("products_*.csv"))
     if not snapshots:
         return {}
-    with open(snapshots[-1], newline="", encoding="utf-8") as handle:
-        return {
-            int(r["id"]): (r["name"], r["normalized_name"])
-            for r in csv.DictReader(handle)
-        }
+    with open(snapshots[-1], newline="", encoding=RAW_ENCODING) as handle:
+        reader = csv.DictReader(handle)
+        _check_header(snapshots[-1], reader.fieldnames, PRODUCT_COLUMNS)
+        try:
+            return {int(r["id"]): (r["name"], r["normalized_name"]) for r in reader}
+        except ValueError as exc:
+            raise RawDataError(f"{snapshots[-1].name}: unreadable row ({exc})") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +348,7 @@ def evaluate_item(events: list[Event]) -> tuple[Purchase | None, str | None]:
         quantity=bought.quantity,
         unit=bought.unit,
         purchased_at=bought.occurred_at,
+        source_event_id=bought.id,
     ), None
 
 
@@ -427,7 +474,8 @@ def compare_with_truth(summary: dict[str, dict], truth: dict) -> list[dict]:
 #
 # Layout:
 #   clean/_latest.json                 <- pointer: {"run_id": ...}
-#   clean/runs/<run_id>/purchases.csv, purchase_intervals.csv, quarantine.csv
+#   clean/runs/<run_id>/purchases.csv, purchase_intervals.csv, quarantine.csv,
+#                       manifest.json (lineage), quality_report.json (the gate)
 #
 # Writing each file atomically is not enough: a crash after the first file
 # leaves a mixture of two runs. Instead:
@@ -437,21 +485,46 @@ def compare_with_truth(summary: dict[str, dict], truth: dict) -> list[dict]:
 # Step 3 is the COMMIT. Before it, readers still see the previous run; after
 # it, the new one. There is no moment with a mixture.
 #
-# The run id is a hash of the content, so re-running on unchanged data
-# produces the same id and creates nothing new.
+# THE QUALITY GATE DECIDES STEP 3. A run that fails the gate gets steps 1-2
+# (the folder stays, so a person can open quality_report.json and see why) but
+# NOT step 3: the pointer keeps naming the last run that passed.
+#
+# The run id is a hash of the data tables plus the fingerprint of the raw
+# inputs, so re-running on unchanged data produces the same id and creates
+# nothing new. The metadata files (manifest, report) are NOT part of the hash:
+# they contain timestamps and would make every run look different.
 
 RUNS_DIR = "runs"
 POINTER_FILE = "_latest.json"
 KEEP_RUNS = 5   # the current run plus the most recent older ones
+REFRESHED_EXTRAS = ("quality_report.json",)   # rewritten even for an existing run
 
 
-def publish_run(out_dir: Path, tables: dict[str, str]) -> str:
-    """Publish rendered CSV texts as one run. Returns the run id."""
-    digest = hashlib.sha256()
+def compute_run_id(tables: dict[str, str], fingerprint: str = "") -> str:
+    digest = hashlib.sha256(fingerprint.encode("utf-8") + b"\0")
     for name in sorted(tables):
         digest.update(name.encode("utf-8") + b"\0")
         digest.update(tables[name].encode("utf-8") + b"\0")
-    run_id = digest.hexdigest()[:12]
+    return digest.hexdigest()[:12]
+
+
+def _write_text(path: Path, text: str) -> None:
+    # newline="" writes the text exactly as given (no Windows line-ending changes).
+    path.write_text(text, encoding="utf-8", newline="")
+
+
+def publish_run(
+    out_dir: Path,
+    tables: dict[str, str],
+    *,
+    extras: dict[str, str] | None = None,
+    fingerprint: str = "",
+    commit: bool = True,
+) -> str:
+    """Write one run folder; move the pointer to it only if `commit` is True.
+    Returns the run id."""
+    extras = extras or {}
+    run_id = compute_run_id(tables, fingerprint)
 
     runs = out_dir / RUNS_DIR
     runs.mkdir(parents=True, exist_ok=True)
@@ -462,34 +535,46 @@ def publish_run(out_dir: Path, tables: dict[str, str]) -> str:
     if not run_dir.exists():
         staging = runs / f".tmp-{run_id}"
         staging.mkdir()
-        for name, text in tables.items():
-            # newline="" writes the text exactly as rendered by the csv module.
-            (staging / name).write_text(text, encoding="utf-8", newline="")
+        for name, text in {**tables, **extras}.items():
+            _write_text(staging / name, text)
         os.replace(staging, run_dir)               # the folder appears complete
+    else:
+        # Same inputs and outputs as an earlier run. Its data and lineage are
+        # identical by construction; only the verdict may need refreshing.
+        for name in REFRESHED_EXTRAS:
+            if name in extras:
+                temporary = run_dir / (name + ".tmp")
+                _write_text(temporary, extras[name])
+                os.replace(temporary, run_dir / name)
 
     pointer = out_dir / POINTER_FILE
-    temporary = pointer.with_name(pointer.name + ".tmp")
-    temporary.write_text(json.dumps({
-        "run_id": run_id,
-        "published_at": datetime.now(timezone.utc).isoformat(),
-        "files": sorted(tables),
-    }, indent=2), encoding="utf-8")
-    os.replace(temporary, pointer)                 # COMMIT
+    if commit:
+        temporary = pointer.with_name(pointer.name + ".tmp")
+        temporary.write_text(json.dumps({
+            "run_id": run_id,
+            "published_at": datetime.now(timezone.utc).isoformat(),
+            "files": sorted(tables),
+        }, indent=2), encoding="utf-8")
+        os.replace(temporary, pointer)             # COMMIT
 
-    # Tidy up AFTER the commit: a failure here cannot hurt the result.
+    # Tidy up AFTER the commit: a failure here cannot hurt the result. Never
+    # remove the run the pointer names, nor the run we just wrote.
+    protected = {run_id}
+    if pointer.exists():
+        protected.add(json.loads(pointer.read_text(encoding="utf-8"))["run_id"])
     older = sorted(
         (d for d in runs.iterdir()
-         if d.is_dir() and d.name != run_id and not d.name.startswith(".")),
+         if d.is_dir() and d.name not in protected and not d.name.startswith(".")),
         key=lambda d: d.stat().st_mtime, reverse=True,
     )
-    for old in older[KEEP_RUNS - 1:]:
+    for old in older[max(KEEP_RUNS - len(protected), 0):]:
         shutil.rmtree(old, ignore_errors=True)
     return run_id
 
 
 def latest_clean_dir(out_dir: Path) -> Path:
-    """The folder holding the newest COMPLETE results. Consumers (the ML
-    layer) use this instead of hard-coding paths."""
+    """The folder holding the newest PUBLISHED (gate-passed) results.
+    Consumers (the ML layer) use this instead of hard-coding paths."""
     pointer = out_dir / POINTER_FILE
     if not pointer.exists():
         raise FileNotFoundError(f"No published results in {out_dir}. Run the pipeline first.")
@@ -497,10 +582,25 @@ def latest_clean_dir(out_dir: Path) -> Path:
     return out_dir / RUNS_DIR / run_id
 
 
-def run(raw_dir: Path, out_dir: Path, truth_path: Path | None = None) -> int:
+def run(
+    raw_dir: Path,
+    out_dir: Path,
+    truth_path: Path | None = None,
+    *,
+    now: datetime | None = None,
+) -> int:
     """Clean the raw files and report. Returns 0 on success, 1 on a problem
-    (no input, or a mismatch with the answer key)."""
-    events, unparsed, stats = load_events(raw_dir)
+    (no input, quality gate FAIL, conflicting duplicates, or a mismatch with
+    the answer key)."""
+    now = now.astimezone(timezone.utc) if now else datetime.now(timezone.utc)
+
+    try:
+        events, unparsed, stats = load_events(raw_dir)
+        names = load_product_names(raw_dir)
+    except RawDataError as exc:
+        # Nothing is published: the previous good run stays the latest.
+        print(f"RAW DATA ERROR: {exc}\nNothing was published; the latest published run is unchanged.")
+        return 1
     if stats["files"] == 0:
         print(f"No raw files in {raw_dir}. Run the extraction first.")
         return 1
@@ -510,15 +610,14 @@ def run(raw_dir: Path, out_dir: Path, truth_path: Path | None = None) -> int:
     purchases, quarantined = build_purchases(events, tainted)
     quarantined = unparsed + [q for q in quarantined if q not in unparsed]
 
-    names = load_product_names(raw_dir)
     intervals = compute_intervals(purchases, names)
     summary = summarise_by_product(purchases, intervals, names)
 
-    # Render all three files in memory first, then publish them together.
+    # Render all three files in memory first, then judge them, then publish.
     tables = {
         "purchases.csv": render_csv(
             ("item_id", "product_id", "product_name", "list_id", "quantity",
-             "unit", "purchased_at", "purchase_date"),
+             "unit", "purchased_at", "purchase_date", "source_event_id"),
             [
                 {**vars(p), "purchase_date": p.purchase_date,
                  "product_name": names.get(p.product_id, ("", ""))[0]}
@@ -535,11 +634,58 @@ def run(raw_dir: Path, out_dir: Path, truth_path: Path | None = None) -> int:
             [vars(q) for q in quarantined],
         ),
     }
-    run_id = publish_run(out_dir, tables)
 
+    # Lineage: exactly which raw bytes and which code produced this run.
+    inputs = describe_inputs(raw_dir)
+    run_id = compute_run_id(tables, inputs["fingerprint"])
+    manifest = build_manifest(
+        run_id=run_id, created_at=now, inputs=inputs,
+        counts={
+            "events_read": stats["rows_read"],
+            "duplicates_ignored": stats["duplicates"],
+            "conflicts": stats["conflicts"],
+            "events_quarantined": len(quarantined),
+            "purchases": len(purchases),
+            "intervals": len(intervals),
+        },
+        rules=RULES, transform_version=TRANSFORM_VERSION,
+        contract_version=CONTRACT_VERSION, code=git_state(PROJECT_ROOT),
+    )
 
-    problem = False
-    print(f"published run {run_id} ({out_dir / RUNS_DIR / run_id})")
+    # The gate: a verdict, not just a report.
+    report = run_gate(
+        tables,
+        known_product_ids=set(names),
+        events_read=stats["rows_read"],
+        quarantined_events=len(quarantined),
+        newest_event_at=max((e.occurred_at for e in events), default=None),
+        previous_purchases=read_previous_purchase_count(out_dir),
+        now=now,
+    )
+    publish_run(
+        out_dir, tables,
+        extras={
+            "manifest.json": json.dumps(manifest, indent=2),
+            "quality_report.json": json.dumps(report.to_dict(), indent=2),
+        },
+        fingerprint=inputs["fingerprint"],
+        commit=report.passed,
+    )
+
+    problem = not report.passed
+    run_path = out_dir / RUNS_DIR / run_id
+    if report.passed:
+        print(f"published run {run_id} ({run_path})")
+    else:
+        print(f"REJECTED run {run_id}: kept for diagnosis at {run_path}; "
+              "the latest PUBLISHED run is unchanged.")
+    print(f"quality gate: {report.status} ({len(report.checks)} checks, "
+          f"{len(report.failures)} critical failure(s), {len(report.warnings)} warning(s))")
+    for check in report.failures:
+        print(f"  FAIL  {check.name}: {check.detail}")
+    for check in report.warnings:
+        print(f"  WARN  {check.name}: {check.detail}")
+
     print(f"read {stats['rows_read']} rows from {stats['files']} file(s); "
           f"{stats['duplicates']} duplicate(s) ignored")
     if stats["conflicts"]:

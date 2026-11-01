@@ -248,7 +248,8 @@ def test_unparseable_rows_taint_their_item():
 
 def purchase(day, product_id=1):
     return Purchase(item_id=day, product_id=product_id, list_id=1, quantity=Decimal(1),
-                    unit="kg", purchased_at=datetime(2026, 10, day, 10, tzinfo=timezone.utc))
+                    unit="kg", purchased_at=datetime(2026, 10, day, 10, tzinfo=timezone.utc),
+                    source_event_id=day)
 
 
 def test_intervals_are_whole_days_between_purchase_dates():
@@ -262,9 +263,11 @@ def test_intervals_are_whole_days_between_purchase_dates():
 def test_intervals_ignore_hours_and_do_not_mix_products():
     names = {1: ("Rice", "rice"), 2: ("Milk", "milk")}
     late = Purchase(item_id=9, product_id=1, list_id=1, quantity=Decimal(1), unit="kg",
-                    purchased_at=datetime(2026, 10, 3, 23, 59, tzinfo=timezone.utc))
+                    purchased_at=datetime(2026, 10, 3, 23, 59, tzinfo=timezone.utc),
+                    source_event_id=9)
     early = Purchase(item_id=8, product_id=1, list_id=1, quantity=Decimal(1), unit="kg",
-                     purchased_at=datetime(2026, 10, 1, 0, 1, tzinfo=timezone.utc))
+                     purchased_at=datetime(2026, 10, 1, 0, 1, tzinfo=timezone.utc),
+                     source_event_id=8)
 
     rows = compute_intervals([early, late, purchase(5, product_id=2)], names)
 
@@ -440,9 +443,14 @@ def test_a_conflict_quarantines_the_whole_item_and_fails_the_run(tmp_path, capsy
 
     assert code == 1
     assert "DIFFERENT content" in capsys.readouterr().out
-    quarantine = (latest_clean_dir(clean) / "quarantine.csv").read_text(encoding="utf-8")
+    # Here most events end up rejected, so the quality gate FAILS: the run is
+    # kept for diagnosis, but it is NOT published.
+    with pytest.raises(FileNotFoundError):
+        latest_clean_dir(clean)
+    (rejected,) = (clean / "runs").iterdir()
+    quarantine = (rejected / "quarantine.csv").read_text(encoding="utf-8")
     assert "conflicting copies of event id 2" in quarantine
-    purchases = (latest_clean_dir(clean) / "purchases.csv").read_text(encoding="utf-8")
+    purchases = (rejected / "purchases.csv").read_text(encoding="utf-8")
     assert len(purchases.strip().splitlines()) == 1       # header only: no purchase from item 1
 
 
@@ -518,3 +526,151 @@ def test_old_runs_are_pruned_but_the_current_one_stays(tmp_path):
 def test_reading_before_any_run_explains_what_to_do(tmp_path):
     with pytest.raises(FileNotFoundError, match="Run the pipeline first"):
         latest_clean_dir(tmp_path)
+
+
+# ------------------- gate, lineage and publishing together --------------
+
+NOW_AFTER = datetime(2026, 11, 1, tzinfo=timezone.utc)
+
+
+def _prepared_raw(tmp_path):
+    raw, clean = tmp_path / "raw", tmp_path / "clean"
+    items = generate_history(PRODUCT_PROFILES, end=END, days=180, seed=42)
+    write_raw_files(raw, items)
+    return raw, clean
+
+
+def test_a_passing_run_is_published_with_its_manifest_and_report(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+
+    assert transform.run(raw, clean, now=NOW_AFTER) == 0
+
+    folder = latest_clean_dir(clean)
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((folder / "quality_report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "PASS"
+    assert manifest["run_id"] == folder.name
+    assert manifest["contract_version"] and manifest["transform_version"]
+    assert manifest["counts"]["purchases"] == 90
+    assert manifest["inputs"]["event_files"][0]["sha256"]
+    assert any(rule.startswith("R5") for rule in manifest["rules"])
+
+
+def test_every_purchase_leads_back_to_its_source_event(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+
+    with open(latest_clean_dir(clean) / "purchases.csv", newline="", encoding="utf-8") as handle:
+        purchases = list(csv.DictReader(handle))
+    events = {str(e.id): e for e in load_events(raw)[0]}
+
+    assert len(purchases) == 90
+    for row in purchases:
+        source = events[row["source_event_id"]]
+        assert source.event_type == "purchased"
+        assert str(source.item_id) == row["item_id"]
+
+
+def test_a_failing_gate_keeps_the_previous_published_run(tmp_path, capsys):
+    raw, clean = _prepared_raw(tmp_path)
+    assert transform.run(raw, clean, now=NOW_AFTER) == 0
+    published = latest_clean_dir(clean).name
+
+    # Break the data: a NEWER products snapshot without Rice. Every Rice
+    # purchase now points at a product that does not exist.
+    write_csv_atomic(
+        raw / "products" / "products_20261101T000000Z.csv", PRODUCT_COLUMNS,
+        [{"id": i, "name": p.name, "normalized_name": p.name.casefold(),
+          "default_unit": p.unit, "category": p.category, "created_at": END, "is_active": True}
+         for i, p in enumerate(PRODUCT_PROFILES, start=1) if p.name != "Rice"],
+    )
+    capsys.readouterr()
+
+    code = transform.run(raw, clean, now=NOW_AFTER)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "quality gate: FAIL" in out and "REJECTED run" in out
+    assert latest_clean_dir(clean).name == published              # readers still get the good run
+    rejected = [d for d in (clean / "runs").iterdir() if d.name != published]
+    assert len(rejected) == 1                                      # kept for diagnosis
+    report = json.loads((rejected[0] / "quality_report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "FAIL"
+
+
+def test_same_inputs_keep_the_run_id_and_new_inputs_change_it(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    first = latest_clean_dir(clean).name
+
+    transform.run(raw, clean, now=NOW_AFTER)
+    assert latest_clean_dir(clean).name == first
+
+    # A new raw batch with an event that does not create any purchase: the
+    # outputs may stay identical, but the INPUT changed, so it is a new run.
+    write_csv_atomic(
+        raw / "item_events" / "item_events_000999999_000999999.csv", EVENT_COLUMNS,
+        [{"id": 999999, "item_id": 999999, "product_id": 1, "list_id": 1,
+          "event_type": "added", "quantity": "1", "unit": "kg", "actor_user_id": 1,
+          "occurred_at": "2026-10-30T10:00:00+00:00"}],
+    )
+    transform.run(raw, clean, now=NOW_AFTER)
+    assert latest_clean_dir(clean).name != first
+
+
+# ------------- files written by other tools (BOM, wrong columns) -------------
+
+def _products_rows(skip=None):
+    return [{"id": i, "name": p.name, "normalized_name": p.name.casefold(),
+             "default_unit": p.unit, "category": p.category, "created_at": END, "is_active": True}
+            for i, p in enumerate(PRODUCT_PROFILES, start=1) if p.name != skip]
+
+
+def _write_with_bom(path, columns, rows):
+    """What PowerShell 5's `Set-Content -Encoding utf8` or Excel produce."""
+    from data_engineering.extract import render_csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+        handle.write(render_csv(columns, rows))
+
+
+def test_a_file_with_a_byte_order_mark_is_read_correctly(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+    snapshot = next((raw / "products").glob("*.csv"))
+    _write_with_bom(snapshot, PRODUCT_COLUMNS, _products_rows())
+
+    assert transform.run(raw, clean, now=NOW_AFTER) == 0
+    assert load_product_names(raw)[1] == ("Rice", "rice")     # no "﻿id" column trouble
+
+
+def test_a_bom_snapshot_missing_a_product_is_rejected_by_the_gate_not_by_a_crash(tmp_path, capsys):
+    # The exact experiment from the hands-on test on Windows.
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    published = latest_clean_dir(clean).name
+    _write_with_bom(raw / "products" / "products_29991231T000000Z.csv",
+                    PRODUCT_COLUMNS, _products_rows(skip="Rice"))
+    capsys.readouterr()
+
+    code = transform.run(raw, clean, now=NOW_AFTER)
+
+    assert code == 1 and "quality gate: FAIL" in capsys.readouterr().out
+    assert latest_clean_dir(clean).name == published
+
+
+@pytest.mark.parametrize("folder, name", [
+    ("products", "products_29991231T000000Z.csv"),
+    ("item_events", "item_events_000999999_000999999.csv"),
+])
+def test_a_file_with_the_wrong_columns_stops_the_run_with_a_clear_message(tmp_path, capsys, folder, name):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+    published = latest_clean_dir(clean).name
+    (raw / folder / name).write_text("identifier,label\r\n1,x\r\n", encoding="utf-8")
+    capsys.readouterr()
+
+    code = transform.run(raw, clean, now=NOW_AFTER)     # must not raise
+
+    out = capsys.readouterr().out
+    assert code == 1 and "RAW DATA ERROR" in out and name in out
+    assert latest_clean_dir(clean).name == published

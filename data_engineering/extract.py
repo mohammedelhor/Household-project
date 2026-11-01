@@ -70,7 +70,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 
 from backend.app.db.models import ItemEvent, Product
@@ -286,7 +286,7 @@ def read_extracted_ids(out_dir: Path) -> set[int]:
     """Every event id present in our batch files (duplicates collapse)."""
     ids: set[int] = set()
     for path in (out_dir / "item_events").glob("item_events_*.csv"):
-        with open(path, newline="", encoding="utf-8") as handle:
+        with open(path, newline="", encoding="utf-8-sig") as handle:   # tolerate a BOM
             ids.update(int(row["id"]) for row in csv.DictReader(handle))
     return ids
 
@@ -300,9 +300,12 @@ def reconcile_item_events(
     """Find rows with id <= bookmark that exist in the source but not in our
     files, and fetch them. See "RECONCILIATION" at the top of this file.
 
-    Cost: one COUNT per run (cheap, uses the primary key). The list of ids is
-    only fetched when the counts disagree. Reading our own ids is a local
-    file scan; fine at this size, and an easy thing to optimise later.
+    We compare the two SETS of ids, never just their sizes: a row that
+    arrived late and a row that vanished can cancel out in a count (source
+    {1, 3} vs ours {1, 2} both have two ids, yet 3 is missing and 2 is gone).
+    Cost: one index-only read of the ids up to the bookmark per run, plus a
+    local scan of our own files. Fine at this size; if it ever gets slow,
+    optimise by comparing per id range, but never by dropping the id check.
     """
     now = _as_utc(now) if now else datetime.now(timezone.utc)
     watermark = read_state(out_dir).get("item_events_last_id", 0)
@@ -313,12 +316,6 @@ def reconcile_item_events(
     ours = read_extracted_ids(out_dir)
 
     with engine.connect() as connection:
-        source_count = connection.execute(
-            select(func.count()).select_from(table).where(table.c.id <= watermark)
-        ).scalar_one()
-        if source_count == len(ours):
-            return Reconciliation()   # same number of rows: nothing arrived late
-
         source_ids = set(connection.execute(
             select(table.c.id).where(table.c.id <= watermark)
         ).scalars())
