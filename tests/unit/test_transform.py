@@ -743,3 +743,96 @@ def test_a_rejected_execution_is_logged_as_not_published(tmp_path):
 
     last = json.loads((clean / "publish_log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert last["gate"] == "FAIL" and last["published"] is False
+
+
+# ---------- every file that affects the pipeline's decisions is in the identity ----------
+
+import ast
+import importlib.util
+import shutil
+from pathlib import Path
+
+
+def _copies_of_the_code(tmp_path):
+    """Copy every identity file somewhere writable so a test can edit one."""
+    folder = tmp_path / "code"
+    folder.mkdir()
+    copies = []
+    for original in transform.CODE_FILES:
+        copy = folder / original.name
+        shutil.copyfile(original, copy)
+        copies.append(copy)
+    return tuple(copies)
+
+
+def test_the_identity_covers_the_four_files_that_decide_the_pipeline():
+    assert {p.name for p in transform.CODE_FILES} == {
+        "transform.py", "contracts.py", "quality_gate.py", "units.py"}
+
+
+@pytest.mark.parametrize("changed", ["transform.py", "contracts.py", "quality_gate.py", "units.py"])
+def test_changing_any_identity_file_changes_the_logic_identity(tmp_path, monkeypatch, changed):
+    copies = _copies_of_the_code(tmp_path)
+    monkeypatch.setattr(transform, "CODE_FILES", copies)
+    before = transform.logic_identity()
+
+    target = next(p for p in copies if p.name == changed)
+    target.write_text(target.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
+
+    assert transform.logic_identity() != before
+
+
+@pytest.mark.parametrize("changed", ["quality_gate.py", "units.py"])
+def test_editing_gate_or_units_creates_a_new_run_with_identical_numbers(tmp_path, monkeypatch, changed):
+    # The case from the review: the rules of the gate or the supported units
+    # change, the numbers do not, and an old run folder must NOT be reused.
+    raw, clean = _prepared_raw(tmp_path)
+    copies = _copies_of_the_code(tmp_path)
+    monkeypatch.setattr(transform, "CODE_FILES", copies)
+    transform.run(raw, clean, now=NOW_AFTER)
+    first = latest_clean_dir(clean)
+
+    target = next(p for p in copies if p.name == changed)
+    target.write_text(target.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
+    transform.run(raw, clean, now=NOW_AFTER)
+    second = latest_clean_dir(clean)
+
+    assert second.name != first.name
+    assert (second / "purchases.csv").read_bytes() == (first / "purchases.csv").read_bytes()
+    recorded = json.loads((second / "manifest.json").read_text(encoding="utf-8"))["code"]["source_files"]
+    old = json.loads((first / "manifest.json").read_text(encoding="utf-8"))["code"]["source_files"]
+    assert [name for name in recorded if recorded[name] != old[name]] == [changed]   # says WHICH file
+
+
+def test_the_manifest_records_a_hash_for_every_identity_file(tmp_path):
+    raw, clean = _prepared_raw(tmp_path)
+    transform.run(raw, clean, now=NOW_AFTER)
+
+    code = json.loads((latest_clean_dir(clean) / "manifest.json").read_text(encoding="utf-8"))["code"]
+
+    assert set(code["source_files"]) == {"transform.py", "contracts.py", "quality_gate.py", "units.py"}
+    assert all(len(h) == 16 for h in code["source_files"].values())
+
+
+def test_no_project_module_imported_by_the_logic_is_forgotten():
+    # If this fails, the logic started importing a project file that is neither
+    # part of the identity (CODE_FILES) nor explicitly excluded with a reason
+    # (NOT_PART_OF_IDENTITY): a change in it would silently reuse an old run.
+    covered = {p.resolve() for p in transform.CODE_FILES}
+    unaccounted = []
+    for source in transform.CODE_FILES:
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            else:
+                continue
+            for name in names:
+                if not name.startswith(("data_engineering", "backend")):
+                    continue
+                origin = Path(importlib.util.find_spec(name).origin).resolve()
+                if origin not in covered and origin.name not in transform.NOT_PART_OF_IDENTITY:
+                    unaccounted.append(f"{source.name} imports {name}")
+
+    assert unaccounted == []

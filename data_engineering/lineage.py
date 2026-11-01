@@ -70,19 +70,30 @@ def describe_inputs(raw_dir: Path) -> dict:
     return {"fingerprint": combined, "event_files": event_files, "products_snapshot": products}
 
 
-def code_fingerprint(paths: list[Path]) -> str:
-    """A hash of the SOURCE of the files that decide what the results are.
+def code_file_hashes(paths: list[Path]) -> dict[str, str]:
+    """file name -> short hash of its SOURCE, for the files that decide what
+    the results are. Recorded in the manifest so a person can see WHICH file
+    differs between two runs, not only that something does.
 
     Version constants rely on someone remembering to bump them; this does not.
     Line endings are normalised first, because the same file is "\r\n" on
     one Windows checkout and "\n" on another (git autocrlf), and that must not
     change the identity of the code.
     """
-    digest = hashlib.sha256()
-    for path in sorted(paths, key=lambda p: p.name):
-        digest.update(path.name.encode("utf-8") + b"\0")
-        digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
-    return digest.hexdigest()[:16]
+    names = [p.name for p in paths]
+    if len(set(names)) != len(names):
+        raise ValueError(f"code files must have distinct names: {names}")
+    return {
+        path.name: hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:16]
+        for path in sorted(paths, key=lambda p: p.name)
+    }
+
+
+def code_fingerprint(paths: list[Path]) -> str:
+    """One hash over all of them: the identity of the code as a whole."""
+    return hashlib.sha256(
+        json.dumps(code_file_hashes(paths), sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def git_state(project_root: Path) -> dict:

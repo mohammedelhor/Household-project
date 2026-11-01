@@ -61,12 +61,15 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from backend.app.core.units import SUPPORTED_UNITS
+import backend.app.core.units as units_module
 import data_engineering.contracts as contracts_module
+import data_engineering.quality_gate as quality_gate_module
 from data_engineering.contracts import CONTRACT_VERSION
 from data_engineering.extract import DEFAULT_OUT_DIR as DEFAULT_RAW_DIR
 from data_engineering.extract import EVENT_COLUMNS, PRODUCT_COLUMNS, render_csv
 from data_engineering.lineage import (
     build_manifest,
+    code_file_hashes,
     code_fingerprint,
     describe_inputs,
     git_state,
@@ -83,9 +86,27 @@ EVENT_TYPES = frozenset({"added", "purchased", "reverted", "archived"})
 # a purchase, what gets quarantined), so two runs made with different logic
 # can never be mistaken for each other.
 TRANSFORM_VERSION = "1.0.0"
-# The source files that decide what the results are. Their content is part of
-# every run's identity (see `logic_identity`).
-CODE_FILES = (Path(__file__), Path(contracts_module.__file__))
+# The source files that decide WHAT THE PIPELINE DECIDES. Their content is part
+# of every run's identity (see `logic_identity`), so changing any of them gives
+# a new run even if the numbers come out identical:
+#   transform.py     what counts as a purchase, what is quarantined
+#   contracts.py     the shape and meaning of the output
+#   quality_gate.py  which data is allowed to be published
+#   units.py         which units are valid (checked by the cleaning AND the contract)
+CODE_FILES = (
+    Path(__file__),
+    Path(contracts_module.__file__),
+    Path(quality_gate_module.__file__),
+    Path(units_module.__file__),
+)
+# Project files these ones import but that are deliberately NOT part of the
+# identity, with the reason. A test fails if the logic starts importing a
+# project module that is in neither list, so a file cannot be forgotten.
+NOT_PART_OF_IDENTITY = {
+    "extract.py": "changes how data is extracted, not what the cleaning decides; "
+                  "its CSV rendering is covered because the output bytes are hashed",
+    "lineage.py": "only describes runs (manifest, fingerprints); it decides nothing",
+}
 RULES = (
     "R1 each event is valid on its own (type, positive quantity, supported unit)",
     "R2 all events of an item agree on list, product, quantity and unit",
@@ -671,7 +692,11 @@ def run(
     inputs = describe_inputs(raw_dir)
     logic = logic_identity()
     run_id = compute_run_id(tables, inputs["fingerprint"], logic)
-    code = {**git_state(PROJECT_ROOT), "source_fingerprint": logic.split("|")[-1]}
+    code = {
+        **git_state(PROJECT_ROOT),
+        "source_fingerprint": logic.split("|")[-1],
+        "source_files": code_file_hashes(list(CODE_FILES)),   # which file is which
+    }
     manifest = build_manifest(
         run_id=run_id, created_at=now, inputs=inputs,
         counts={
