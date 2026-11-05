@@ -48,6 +48,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from backend.app.core.units import SUPPORTED_UNITS
+from backend.app.db.event_admin import allow_event_correction
 from backend.app.db.models import (
     Household,
     HouseholdMember,
@@ -383,6 +384,10 @@ def clear_synthetic_rows(session: Session) -> None:
         ShoppingList.owner_user_id.in_(user_ids) | ShoppingList.household_id.in_(household_ids)
     )
 
+    # item_events is append-only in the database. Removing the events of a
+    # SYNTHETIC user is the one legitimate deletion, so it says so explicitly
+    # (valid for this transaction only; see backend/app/db/event_admin.py).
+    allow_event_correction(session)
     session.execute(delete(ItemEvent).where(ItemEvent.list_id.in_(list_ids)))
     session.execute(delete(ShoppingListItem).where(ShoppingListItem.list_id.in_(list_ids)))
     session.execute(delete(ShoppingList).where(

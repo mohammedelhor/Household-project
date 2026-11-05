@@ -298,6 +298,10 @@ class ShoppingListItem(Base):
             "status IN ('needed', 'purchased')",
             name="ck_shopping_list_item_status",
         ),
+        CheckConstraint(
+            _unit_check_sql("unit"),
+            name="ck_shopping_list_item_unit_supported",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -339,11 +343,7 @@ class ShoppingListItem(Base):
         nullable=False,
         default="needed",
     )
-    CheckConstraint(
-        _unit_check_sql("unit"),
-        name="ck_shopping_list_item_unit_supported",
-        ),
-
+    
     created_by_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
@@ -380,6 +380,9 @@ class ItemEvent(Base):
     bought on the 3rd, again on the 19th" => consumption rate. A status
     column overwrites itself, so history would be lost. Rows here are only
     ever INSERTED, never updated or deleted.
+    This is enforced by a database trigger (migration c4d8f2a61b73); the only exception is
+    the ON DELETE SET NULL of product_id / actor_user_id. See backend/app/db/event_admin.py
+    for the explicit correction path.
 
     Denormalized on purpose (product_id, quantity, unit, list_id are copied
     from the item at event time): analytics should not need to join back to
