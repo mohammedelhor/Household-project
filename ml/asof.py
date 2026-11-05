@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from data_engineering.scopes import Scope
 from data_engineering.transform import (
     Event,
     Purchase,
@@ -60,21 +61,30 @@ def events_as_of(events: list[Event], cutoff: datetime) -> list[Event]:
 
 
 def purchases_as_of(
-    events: list[Event], cutoff: datetime
+    events: list[Event],
+    cutoff: datetime,
+    list_scopes: dict[int, Scope],
 ) -> tuple[list[Purchase], list[Quarantined]]:
     """The purchases that existed at `cutoff`, using the pipeline's own rules.
 
     A purchase that was reverted AFTER `cutoff` is still a purchase here: at
     that moment nobody knew it would be reverted.
+
+    `list_scopes` (list id -> scope) gives every purchase its owner. The
+    mapping comes from the lists snapshot: a list's owner never changes (the
+    quality gate fails if it does), so the newest snapshot is valid for every
+    cutoff, and a list created after the cutoff has no events before it.
     """
-    return build_purchases(events_as_of(events, cutoff))
+    return build_purchases(events_as_of(events, cutoff), None, list_scopes)
 
 
 def intervals_as_of(
     events: list[Event],
     cutoff: datetime,
     names: dict[int, tuple[str, str]],
+    list_scopes: dict[int, Scope],
 ) -> list[dict]:
-    """Days between consecutive purchases, from the purchases known at `cutoff`."""
-    purchases, _ = purchases_as_of(events, cutoff)
+    """Days between consecutive purchases (per scope and product), from the
+    purchases known at `cutoff`."""
+    purchases, _ = purchases_as_of(events, cutoff, list_scopes)
     return compute_intervals(purchases, names)

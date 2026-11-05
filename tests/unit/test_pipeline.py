@@ -40,9 +40,9 @@ def engine():
 def truth_path(engine, tmp_path):
     items = generate_history(PRODUCT_PROFILES, end=END, days=180, seed=42)
     with Session(engine) as session:
-        write_to_database(session, items)
+        scope_keys = write_to_database(session, items)
         session.commit()
-    truth = build_ground_truth(items, PRODUCT_PROFILES, end=END, days=180, seed=42)
+    truth = build_ground_truth(items, end=END, days=180, seed=42, scope_keys=scope_keys)
     path = tmp_path / "truth.json"
     path.write_text(json.dumps(truth), encoding="utf-8")
     return path

@@ -10,6 +10,10 @@ WHAT IT DOES
 - item_events (append-only, grows forever): only NEW rows are fetched each
   run, using "the highest id I already extracted" as a bookmark (watermark).
 - products (small, rows can change): a full snapshot is written each run.
+- shopping_lists (small): a snapshot of (id, owner_user_id, household_id),
+  written only when it changed. It says WHOSE list every event belongs to
+  (see scopes.py). It is taken AFTER the events on purpose: lists are never
+  deleted, so any list that has an event is already in a later snapshot.
 
 THREE DECISIONS WORTH UNDERSTANDING
 -----------------------------------
@@ -73,7 +77,8 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 
-from backend.app.db.models import ItemEvent, Product
+from backend.app.db.models import ItemEvent, Product, ShoppingList
+from data_engineering.scopes import LIST_COLUMNS, LISTS_FOLDER
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = PROJECT_ROOT / "data" / "raw"
@@ -275,6 +280,34 @@ def extract_products_snapshot(
     return path
 
 
+def extract_lists_snapshot(
+    engine: Engine,
+    out_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> Path | None:
+    """Save every list's owner, but only when it differs from the newest
+    snapshot. Every snapshot is kept: if a list's owner ever changed, the
+    quality gate needs the older ones to notice (see scopes.py)."""
+    now = _as_utc(now) if now else datetime.now(timezone.utc)
+
+    table = ShoppingList.__table__
+    query = select(*(table.c[name] for name in LIST_COLUMNS)).order_by(table.c.id)
+    with engine.connect() as connection:
+        rows = connection.execute(query).mappings().all()
+
+    content = render_csv(LIST_COLUMNS, rows)
+    existing = sorted((out_dir / LISTS_FOLDER).glob("shopping_lists_*.csv"))
+    if existing:
+        with open(existing[-1], newline="", encoding="utf-8") as handle:
+            if handle.read() == content:
+                return None
+
+    path = out_dir / LISTS_FOLDER / f"shopping_lists_{now.strftime('%Y%m%dT%H%M%SZ')}.csv"
+    write_csv_atomic(path, LIST_COLUMNS, rows)
+    return path
+
+
 @dataclass(frozen=True)
 class Reconciliation:
     recovered: int = 0            # rows that had committed late and were fetched now
@@ -366,6 +399,7 @@ def run(
     )
     reconciliation = reconcile_item_events(engine, out_dir, now=now)
     products_path = extract_products_snapshot(engine, out_dir, now=now)
+    lists_path = extract_lists_snapshot(engine, out_dir, now=now)    # AFTER the events
 
     if reconciliation.recovered:
         # The lag assumption failed once; we healed it, but a person should
@@ -385,6 +419,10 @@ def run(
         print(f"products:    wrote {products_path.name}")
     else:
         print("products:    unchanged")
+    if lists_path:
+        print(f"lists:       wrote {lists_path.name}")
+    else:
+        print("lists:       unchanged")
     return 0
 
 

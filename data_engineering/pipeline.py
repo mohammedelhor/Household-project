@@ -47,6 +47,7 @@ def run_pipeline(
     truth_path: Path | None = None,
     lag_minutes: int = 5,
     now: datetime | None = None,
+    data_origin: str = "unknown",
 ) -> int:
     """Run every step in order. Returns 0 only if ALL steps succeeded."""
     started = time.monotonic()
@@ -61,7 +62,7 @@ def run_pipeline(
         return 1
 
     print("\n== step 2/2: clean ==")
-    code = transform.run(raw_dir, clean_dir, truth_path, now=now)
+    code = transform.run(raw_dir, clean_dir, truth_path, now=now, data_origin=data_origin)
     if code != 0:
         print("\nCLEAN step reported a problem.")
         return code
@@ -71,14 +72,19 @@ def run_pipeline(
 
 
 def main() -> int:
+    # Read .env BEFORE building the parser: a default taken from the environment
+    # (DATA_ORIGIN) is evaluated when the parser is created.
+    load_dotenv(PROJECT_ROOT / ".env")
     parser = argparse.ArgumentParser(description="Run extract then clean.")
     parser.add_argument("--raw-dir", type=Path, default=extract.DEFAULT_OUT_DIR)
     parser.add_argument("--clean-dir", type=Path, default=transform.DEFAULT_CLEAN_DIR)
     parser.add_argument("--truth", type=Path, help="answer key to compare against")
     parser.add_argument("--lag-minutes", type=int, default=5)
+    parser.add_argument("--data-origin", choices=("real", "synthetic", "unknown"),
+                        default=os.getenv("DATA_ORIGIN", "unknown"),
+                        help="what the data is (also read from DATA_ORIGIN): recorded in the manifest")
     args = parser.parse_args()
 
-    load_dotenv(PROJECT_ROOT / ".env")
     url = os.getenv("SOURCE_DATABASE_URL")
     if not url:
         print("SOURCE_DATABASE_URL is not set. Add it to .env.")
@@ -89,6 +95,7 @@ def main() -> int:
         return run_pipeline(
             engine=engine, raw_dir=args.raw_dir, clean_dir=args.clean_dir,
             truth_path=args.truth, lag_minutes=args.lag_minutes,
+            data_origin=args.data_origin,
         )
     finally:
         engine.dispose()

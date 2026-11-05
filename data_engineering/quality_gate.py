@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from data_engineering.contracts import CONTRACTS, validate_table
+from data_engineering.scopes import Scope
 
 QUARANTINE_WARN_SHARE = 0.05      # more than 5% of events rejected -> warning
 QUARANTINE_FAIL_SHARE = 0.50      # half or more rejected          -> FAIL
@@ -93,28 +94,35 @@ def _rows(csv_text: str) -> list[dict[str, str]]:
     return list(csv.DictReader(io.StringIO(csv_text, newline="")))
 
 
-def derive_intervals(purchases: list[dict[str, str]]) -> dict[int, list[tuple[str, str, int]]]:
+def derive_intervals(
+    purchases: list[dict[str, str]],
+) -> dict[tuple[str, int, int], list[tuple[str, str, int]]]:
     """Recompute, independently of the cleaning code, the intervals that the
-    purchases imply: per product, in time order, (previous date, date, days)
-    for every pair of consecutive purchases. Items with no product are skipped.
+    purchases imply: per (scope type, scope id, product), in time order,
+    (previous date, date, days) for every pair of consecutive purchases.
+    Items with no product are skipped.
+
+    The scope is part of the key: two households that buy the same product
+    never share an interval, and this second implementation must say so too.
 
     This is deliberately a second implementation (it works from the published
     CSV text), so a bug in transform.compute_intervals cannot vouch for itself.
     """
-    by_product: dict[int, list[tuple[str, int, date]]] = defaultdict(list)
+    grouped: dict[tuple[str, int, int], list[tuple[str, int, date]]] = defaultdict(list)
     for r in purchases:
         if r["product_id"]:
-            by_product[int(r["product_id"])].append(
+            key = (r["scope_type"], int(r["scope_id"]), int(r["product_id"]))
+            grouped[key].append(
                 (r["purchased_at"], int(r["item_id"]), date.fromisoformat(r["purchase_date"]))
             )
-    derived: dict[int, list[tuple[str, str, int]]] = {}
-    for product, rows in by_product.items():
+    derived: dict[tuple[str, int, int], list[tuple[str, str, int]]] = {}
+    for key, rows in grouped.items():
         rows.sort(key=lambda row: (datetime.fromisoformat(row[0]), row[1]))   # time, then item
-        derived[product] = [
+        derived[key] = [
             (before[2].isoformat(), after[2].isoformat(), (after[2] - before[2]).days)
             for before, after in zip(rows, rows[1:])
         ]
-    return {product: pairs for product, pairs in derived.items() if pairs}
+    return {key: pairs for key, pairs in derived.items() if pairs}
 
 
 def run_gate(
@@ -126,6 +134,9 @@ def run_gate(
     newest_event_at: datetime | None,
     previous_purchases: int | None,
     now: datetime,
+    list_scopes: dict[int, Scope],
+    unresolved_list_ids: set[int],
+    scope_conflicts: list[str],
 ) -> GateReport:
     """Evaluate every check. `tables` maps file name -> rendered CSV text."""
     checks: list[Check] = []
@@ -158,6 +169,21 @@ def run_gate(
     add("purchase_date matches purchased_at (UTC)", "critical", not mismatched,
         f"{len(mismatched)} row(s), first items: {mismatched[:3]}")
 
+    # ---- 2b. scopes: whose history is this? (see scopes.py)
+    # Nothing is guessed: a list without an owner, or an owner that changed,
+    # means purchases could be assigned to the wrong household.
+    add("every list used by an event has an owner in the lists snapshot", "critical",
+        not unresolved_list_ids,
+        f"lists without an owner: {sorted(unresolved_list_ids)[:5]}")
+    add("no list changed owner between lists snapshots", "critical", not scope_conflicts,
+        " | ".join(scope_conflicts[:3]))
+    wrong_scope = [
+        r["item_id"] for r in purchases
+        if list_scopes.get(int(r["list_id"])) != Scope(r["scope_type"], int(r["scope_id"]))
+    ]
+    add("every purchase carries the scope of its list", "critical", not wrong_scope,
+        f"{len(wrong_scope)} row(s), first items: {wrong_scope[:3]}")
+
     # ---- 3. links between tables
     unknown = sorted({int(r["product_id"]) for r in purchases
                       if r["product_id"] and int(r["product_id"]) not in known_product_ids})
@@ -170,24 +196,24 @@ def run_gate(
     # two wrong intervals of 2 and 2 days have the same count (2) and the same
     # total (4). So we derive every interval again and compare them one by one.
     expected = derive_intervals(purchases)
-    found: dict[int, list[tuple[str, str, int]]] = defaultdict(list)
+    found: dict[tuple[str, int, int], list[tuple[str, str, int]]] = defaultdict(list)
     for r in intervals:
-        found[int(r["product_id"])].append(
+        found[(r["scope_type"], int(r["scope_id"]), int(r["product_id"]))].append(
             (r["previous_purchase_date"], r["purchase_date"], int(r["days_since_previous"]))
         )
     wrong = []
-    for product in sorted(set(expected) | set(found)):
-        want, have = expected.get(product, []), found.get(product, [])
+    for key in sorted(set(expected) | set(found)):
+        want, have = expected.get(key, []), found.get(key, [])
         if want != have:
             position = next((i for i, (a, b) in enumerate(zip(want, have)) if a != b),
                             min(len(want), len(have)))
             wrong.append(
-                f"product {product}, interval #{position + 1}: expected "
+                f"{key[0]} {key[1]}, product {key[2]}, interval #{position + 1}: expected "
                 f"{want[position] if position < len(want) else 'none'}, found "
                 f"{have[position] if position < len(have) else 'none'}"
             )
     add("every interval matches the one derived from the purchases", "critical", not wrong,
-        f"{len(wrong)} product(s) differ; " + " | ".join(wrong[:3]))
+        f"{len(wrong)} scope/product group(s) differ; " + " | ".join(wrong[:3]))
 
     # ---- 4. time sanity
     future = [r["item_id"] for r in purchases

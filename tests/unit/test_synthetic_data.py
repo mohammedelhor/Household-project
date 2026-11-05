@@ -12,9 +12,11 @@ from backend.app.core.units import SUPPORTED_UNITS
 from data_engineering.synthetic_data import (
     PRODUCT_PROFILES,
     ProductProfile,
+    TWO_HOUSEHOLDS,
     assert_safe_target,
     build_ground_truth,
     generate_history,
+    generate_households,
 )
 
 END = datetime(2026, 10, 31, tzinfo=timezone.utc)
@@ -72,10 +74,10 @@ def test_every_unit_is_supported_by_the_database_constraint():
 
 
 def test_realized_intervals_match_the_configured_rhythm():
-    truth = build_ground_truth(_history(), PRODUCT_PROFILES, end=END, days=180, seed=42)
+    truth = build_ground_truth(_history(), end=END, days=180, seed=42, scope_keys={None: "user:1"})
 
     for profile in PRODUCT_PROFILES:
-        product = truth["products"][profile.name]
+        product = truth["scopes"]["user:1"]["products"][profile.name]
         assert product["purchases"] >= 5
         assert min(product["intervals_days"]) >= 1
         # The average of many noisy gaps stays close to the configured mean.
@@ -127,3 +129,69 @@ def test_guard_accepts_a_different_database(monkeypatch):
     monkeypatch.setenv("TEST_DATABASE_URL", "postgresql://u:p@ep-bbb.example.com/neondb")
 
     assert_safe_target("postgresql://u:p@ep-ccc.example.com/neondb")  # no exception
+
+
+# ----------------------- households and cancelled purchases -------------------
+
+def _two_households(**overrides):
+    params = {"end": END, "days": 180, "seed": 42}
+    params.update(overrides)
+    return generate_households(TWO_HOUSEHOLDS, **params)
+
+
+def _truth_of_two_households(items):
+    return build_ground_truth(items, end=END, days=180, seed=42,
+                              scope_keys={"family_a": "household:1", "family_b": "household:2"})
+
+
+def test_two_households_have_the_rhythms_they_were_given():
+    truth = _truth_of_two_households(_two_households())["scopes"]
+
+    milk_a = truth["household:1"]["products"]["Milk"]["realized_mean_interval_days"]
+    milk_b = truth["household:2"]["products"]["Milk"]["realized_mean_interval_days"]
+    assert abs(milk_a - 7) < 1.5 and abs(milk_b - 30) < 4     # same product, very different rhythm
+    assert "Rice" not in truth["household:1"]["products"]       # a product A never buys
+
+
+def test_every_item_knows_its_household_and_the_histories_are_independent():
+    items = _two_households()
+    assert {i.household for i in items} == {"family_a", "family_b"}
+
+    only_a = generate_households(TWO_HOUSEHOLDS[:1], end=END, days=180, seed=42)
+    mine = [i for i in items if i.household == "family_a"]
+    assert [(i.profile.name, i.created_at) for i in mine] == \
+           [(i.profile.name, i.created_at) for i in only_a]      # B's existence changes nothing for A
+
+
+def test_cancel_rate_zero_changes_nothing_and_a_positive_rate_never_touches_real_purchases():
+    plain = _history()
+    with_phantoms = _history(cancel_rate=0.5)
+
+    real = [i for i in with_phantoms if not i.cancelled]
+    assert _signature(real) == _signature(plain)               # separate random stream
+    assert any(i.cancelled for i in with_phantoms)
+    assert not any(i.cancelled for i in plain)
+
+
+def test_a_phantom_is_bought_then_reverted_and_never_a_purchase():
+    phantoms = [i for i in _history(cancel_rate=1.0) if i.cancelled]
+
+    assert phantoms
+    for phantom in phantoms:
+        assert [e.event_type for e in phantom.events] == ["added", "purchased", "reverted"]
+        assert phantom.archived_at is None
+        with pytest.raises(ValueError):
+            phantom.effective_purchase
+
+
+def test_phantoms_are_not_in_the_answer_key():
+    plain = build_ground_truth(_history(), end=END, days=180, seed=42, scope_keys={None: "user:1"})
+    noisy = build_ground_truth(_history(cancel_rate=0.5), end=END, days=180, seed=42,
+                               scope_keys={None: "user:1"})
+
+    assert noisy["scopes"] == plain["scopes"]
+
+
+def test_the_answer_key_refuses_to_guess_a_scope_name():
+    with pytest.raises(TypeError):
+        build_ground_truth(_history(), end=END, days=180, seed=42)    # scope_keys is required

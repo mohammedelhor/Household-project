@@ -13,7 +13,7 @@ from data_engineering.contracts import (
     validate_table,
 )
 
-GOOD_PURCHASE = ("1,5,Rice,1,2.000,kg,2026-10-01T10:00:00+00:00,2026-10-01,77")
+GOOD_PURCHASE = ("1,5,Rice,1,household,3,2.000,kg,2026-10-01T10:00:00+00:00,2026-10-01,77")
 HEADER = ",".join(PURCHASES.column_names)
 
 
@@ -60,11 +60,11 @@ def test_wrong_columns_are_reported_by_name():
 
 
 @pytest.mark.parametrize("line, rule", [
-    ("1,5,Rice,1,-2,kg,2026-10-01T10:00:00+00:00,2026-10-01,77", "must be > 0"),
-    ("1,5,Rice,1,2,cup,2026-10-01T10:00:00+00:00,2026-10-01,77", "value not allowed"),
-    ("1,5,Rice,1,2,kg,2026-10-01T10:00:00,2026-10-01,77", "datetime has no time zone"),
-    (",5,Rice,1,2,kg,2026-10-01T10:00:00+00:00,2026-10-01,77", "empty but required"),
-    ("1,5,Rice,1,2,kg,2026-10-01T10:00:00+00:00,2026-10-01", "row length"),
+    ("1,5,Rice,1,household,3,-2,kg,2026-10-01T10:00:00+00:00,2026-10-01,77", "must be > 0"),
+    ("1,5,Rice,1,household,3,2,cup,2026-10-01T10:00:00+00:00,2026-10-01,77", "value not allowed"),
+    ("1,5,Rice,1,household,3,2,kg,2026-10-01T10:00:00,2026-10-01,77", "datetime has no time zone"),
+    (",5,Rice,1,household,3,2,kg,2026-10-01T10:00:00+00:00,2026-10-01,77", "empty but required"),
+    ("1,5,Rice,1,household,3,2,kg,2026-10-01T10:00:00+00:00,2026-10-01", "row length"),
 ])
 def test_bad_rows_are_reported_with_the_line_number(line, rule):
     violations = validate_table(PURCHASES, csv_of(line))
@@ -80,13 +80,13 @@ def test_unique_columns_must_not_repeat():
 
 
 def test_optional_columns_may_be_empty():
-    line = "1,,,1,2,kg,2026-10-01T10:00:00+00:00,2026-10-01,77"   # a free-text item
+    line = "1,,,1,household,3,2,kg,2026-10-01T10:00:00+00:00,2026-10-01,77"   # a free-text item
 
     assert validate_table(PURCHASES, csv_of(line)) == []
 
 
 def test_examples_are_limited_so_a_report_stays_small():
-    lines = [f"{i},5,Rice,1,-2,kg,2026-10-01T10:00:00+00:00,2026-10-01,{i}" for i in range(50)]
+    lines = [f"{i},5,Rice,1,household,3,-2,kg,2026-10-01T10:00:00+00:00,2026-10-01,{i}" for i in range(50)]
 
     (violation,) = validate_table(PURCHASES, csv_of(*lines))
 
@@ -118,3 +118,38 @@ def test_the_dictionary_states_what_purchased_does_not_mean():
 
     assert "not proof that the product was really bought" in text
     assert "FINAL state" in text
+
+
+# ------------------------------- scopes ---------------------------------------
+
+@pytest.mark.parametrize("scope_type, scope_id, fragment", [
+    ("household", "3", None),
+    ("user", "3", None),
+    ("family", "3", "value not allowed"),          # only household / user exist
+    ("household", "0", "must be > 0"),
+    ("household", "", "empty but required"),
+])
+def test_scope_columns_are_checked(scope_type, scope_id, fragment):
+    line = f"1,5,Rice,1,{scope_type},{scope_id},2,kg,2026-10-01T10:00:00+00:00,2026-10-01,77"
+    violations = validate_table(PURCHASES, csv_of(line))
+
+    if fragment is None:
+        assert violations == []
+    else:
+        assert any(fragment in v.rule for v in violations)
+
+
+def test_the_old_file_without_scope_columns_is_rejected():
+    old_header = "item_id,product_id,product_name,list_id,quantity,unit,purchased_at,purchase_date,source_event_id"
+    text = old_header + "\r\n1,5,Rice,1,2.000,kg,2026-10-01T10:00:00+00:00,2026-10-01,77\r\n"
+
+    (violation,) = validate_table(PURCHASES, text)
+
+    assert violation.rule == "columns" and "scope_type" in violation.examples[0]
+
+
+def test_intervals_start_with_the_scope_and_the_dictionary_explains_it():
+    assert PURCHASE_INTERVALS.column_names[:2] == ("scope_type", "scope_id")
+    text = render_data_dictionary()
+    assert "Every purchase belongs to one scope" in text
+    assert "Contract version: **2.0.0**" in text

@@ -1,0 +1,79 @@
+{
+  "status": "PASS",
+  "critical_failures": 0,
+  "warnings": 0,
+  "checks": [
+    {
+      "name": "contract: purchases.csv",
+      "severity": "critical",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "contract: purchase_intervals.csv",
+      "severity": "critical",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "contract: quarantine.csv",
+      "severity": "critical",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "purchase_date matches purchased_at (UTC)",
+      "severity": "critical",
+      "passed": true,
+      "detail": "0 row(s), first items: []"
+    },
+    {
+      "name": "every purchase's product exists in the products snapshot",
+      "severity": "critical",
+      "passed": true,
+      "detail": "unknown product ids: []"
+    },
+    {
+      "name": "intervals can be derived from the purchases",
+      "severity": "critical",
+      "passed": true,
+      "detail": "inconsistent products: []"
+    },
+    {
+      "name": "no purchase is in the future",
+      "severity": "critical",
+      "passed": true,
+      "detail": "0 purchase(s) later than now + 1 day, items: []"
+    },
+    {
+      "name": "less than 50% of events rejected",
+      "severity": "critical",
+      "passed": true,
+      "detail": "0.0% of 253 events rejected"
+    },
+    {
+      "name": "at most 5% of events rejected",
+      "severity": "warning",
+      "passed": true,
+      "detail": "0.0% of 253 events rejected"
+    },
+    {
+      "name": "there is at least one purchase",
+      "severity": "warning",
+      "passed": true,
+      "detail": "no purchases yet: nothing to learn from"
+    },
+    {
+      "name": "purchases did not shrink since the previous run",
+      "severity": "warning",
+      "passed": true,
+      "detail": "90 now vs 90 before (a revert can explain it, an unexplained drop should be looked at)"
+    },
+    {
+      "name": "newest event is recent",
+      "severity": "warning",
+      "passed": true,
+      "detail": "newest event is 1 day(s) old"
+    }
+  ]
+}

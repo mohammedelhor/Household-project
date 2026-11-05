@@ -50,8 +50,13 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from backend.app.core.units import SUPPORTED_UNITS
+from data_engineering.scopes import SCOPE_TYPES
 
-CONTRACT_VERSION = "1.0.0"
+# 2.0.0: purchases and intervals now belong to a SCOPE (household or user).
+# The columns were added, but the MEANING of purchase_intervals changed (it was
+# per product, it is now per scope and product), and a reader that still
+# groups by product alone would silently mix households: a major change.
+CONTRACT_VERSION = "2.0.0"
 DICTIONARY_PATH = Path(__file__).with_name("DATA_DICTIONARY.md")
 
 DTYPES = ("int", "text", "decimal", "date", "datetime")
@@ -99,6 +104,12 @@ PURCHASES = TableContract(
         Column("product_name", "text", "Product name from the newest products "
                "snapshot; empty for free-text items.", nullable=True),
         Column("list_id", "int", "Shopping list the item was on."),
+        Column("scope_type", "text", "Whose history this is: `household` for a "
+               "household's shared list, `user` for a personal list.",
+               allowed=frozenset(SCOPE_TYPES)),
+        Column("scope_id", "int", "Id of the household or of the user (see "
+               "`scope_type`). A user id and a household id with the same number "
+               "are different scopes.", minimum=0, minimum_exclusive=True),
         Column("quantity", "decimal", "Quantity bought, in `unit`.",
                unit="see unit column", minimum=0, minimum_exclusive=True),
         Column("unit", "text", "Unit of `quantity`.",
@@ -116,12 +127,17 @@ PURCHASES = TableContract(
 PURCHASE_INTERVALS = TableContract(
     file="purchase_intervals.csv",
     description=(
-        "Days between consecutive purchases of the same product (items with "
-        "no catalog product are skipped). Rows are grouped by product and, "
-        "inside a product, ordered by time. The quality gate recomputes every "
+        "Days between consecutive purchases of the same product BY THE SAME "
+        "SCOPE (items with no catalog product are skipped). Two households "
+        "never share an interval. Rows are grouped by scope, then product, "
+        "and ordered by time inside each. The quality gate recomputes every "
         "row from purchases.csv and rejects any difference."
     ),
     columns=(
+        Column("scope_type", "text", "`household` or `user` (see purchases.csv).",
+               allowed=frozenset(SCOPE_TYPES)),
+        Column("scope_id", "int", "Id of the household or user.",
+               minimum=0, minimum_exclusive=True),
         Column("product_id", "int", "Catalog product."),
         Column("product_name", "text", "Product name from the newest snapshot."),
         Column("previous_purchase_date", "date", "UTC date of the earlier purchase.",
@@ -155,6 +171,10 @@ CONTRACTS: dict[str, TableContract] = {
 # What the data does and does NOT mean. These are the limits a model builder
 # must know before choosing a target. They appear in DATA_DICTIONARY.md.
 BUSINESS_NOTES = (
+    "**Every purchase belongs to one scope: a household or a single user.** "
+    "The scope is the owner of the list the item was on. Histories of "
+    "different scopes must never be combined into one prediction unit, not "
+    "even for the same product: the unit is (scope_type, scope_id, product_id).",
     "**Purchased means marked as purchased in the app.** It is not proof that "
     "the product was really bought, it is not the quantity in stock "
     "(inventory) and it is not the quantity used up (consumption).",

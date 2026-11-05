@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-01T15:57:22.202617+00:00",
+  "as_of_date": "2026-11-01",
+  "dataset": {
+    "run_id": "986445dca14a",
+    "input_fingerprint": "10650624a6efdd65a8c0d30e74edd1e574164131ddd49544bc73a757b351ed91"
+  },
+  "suggestions": [
+    {
+      "product_id": 13,
+      "product_name": "Rice",
+      "last_purchase_date": "2026-10-18",
+      "typical_gap_days": 14,
+      "expected_date": "2026-11-01",
+      "confidence": "high",
+      "gaps_used": 11
+    },
+    {
+      "product_id": 12,
+      "product_name": "Milk",
+      "last_purchase_date": "2026-10-29",
+      "typical_gap_days": 5,
+      "expected_date": "2026-11-03",
+      "confidence": "high",
+      "gaps_used": 36
+    },
+    {
+      "product_id": 15,
+      "product_name": "Olive oil",
+      "last_purchase_date": "2026-10-07",
+      "typical_gap_days": 28,
+      "expected_date": "2026-11-04",
+      "confidence": "medium",
+      "gaps_used": 5
+    },
+    {
+      "product_id": 11,
+      "product_name": "Eggs",
+      "last_purchase_date": "2026-10-29",
+      "typical_gap_days": 7,
+      "expected_date": "2026-11-05",
+      "confidence": "high",
+      "gaps_used": 25
+    },
+    {
+      "product_id": 14,
+      "product_name": "Sugar",
+      "last_purchase_date": "2026-10-20",
+      "typical_gap_days": 21,
+      "expected_date": "2026-11-10",
+      "confidence": "high",
+      "gaps_used": 8
+    }
+  ]
+}
