@@ -5,10 +5,10 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import Engine, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
-
+from backend.app.db.event_admin import allow_event_correction
 from backend.app.db.models import ItemEvent, ShoppingList, ShoppingListItem, User
 from backend.app.services.shopping_lists import (
     add_shopping_list_item,
@@ -18,7 +18,7 @@ from backend.app.services.shopping_lists import (
 @pytest.mark.integration
 def test_failed_operation_rolls_back_all_changes(
     db_session: Session,
-    test_engine,
+    test_engine: Engine,
 ):
     user = User(
         email="transaction-rollback@example.com",
@@ -68,7 +68,7 @@ def test_failed_operation_rolls_back_all_changes(
 
 @pytest.mark.integration
 def test_concurrent_personal_list_creation_is_protected_by_database(
-    test_engine,
+    test_engine: Engine,
 ):
     SessionFactory = sessionmaker(
         bind=test_engine,
@@ -177,7 +177,7 @@ def test_concurrent_personal_list_creation_is_protected_by_database(
 
 
 @pytest.mark.integration
-def test_outer_transaction_rollback_removes_all_changes(test_engine):
+def test_outer_transaction_rollback_removes_all_changes(test_engine: Engine):
     SessionFactory = sessionmaker(
         bind=test_engine,
         autoflush=False,
@@ -263,7 +263,7 @@ def test_outer_transaction_rollback_removes_all_changes(test_engine):
 
 
 @pytest.mark.integration
-def test_committed_list_and_items_are_visible_in_new_session(test_engine):
+def test_committed_list_and_items_are_visible_in_new_session(test_engine: Engine):
     SessionFactory = sessionmaker(
         bind=test_engine,
         autoflush=False,
@@ -326,6 +326,7 @@ def test_committed_list_and_items_are_visible_in_new_session(test_engine):
 
     finally:
         with SessionFactory() as session:
+            allow_event_correction(session)
             if list_id is not None:
                 # Events reference items/lists by foreign key, so they must
                 # be deleted first (children before parents).

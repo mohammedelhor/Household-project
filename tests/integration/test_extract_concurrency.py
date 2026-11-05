@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import delete, insert
 from sqlalchemy.orm import Session
-
+from backend.app.db.event_admin import allow_event_correction
 from backend.app.db.models import ItemEvent, ShoppingList, ShoppingListItem, User
 from backend.app.services.shopping_lists import add_shopping_list_item, create_shopping_list
 from data_engineering.extract import (
@@ -91,6 +91,7 @@ def test_a_row_committed_after_a_higher_id_is_recovered_by_reconciliation(test_e
             transaction_a.rollback()
         connection_a.close()
         with Session(test_engine) as session:
+            allow_event_correction(session)
             session.execute(delete(ItemEvent).where(ItemEvent.item_id == item_id))
             session.execute(delete(ShoppingListItem).where(ShoppingListItem.list_id == list_id))
             session.execute(delete(ShoppingList).where(ShoppingList.id == list_id))
