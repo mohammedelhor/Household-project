@@ -1,0 +1,261 @@
+{
+  "created_at": "2026-11-01T15:10:34.473387+00:00",
+  "task": "days until the next purchase of the same product",
+  "dataset": {
+    "run_id": "986445dca14a",
+    "input_fingerprint": "10650624a6efdd65a8c0d30e74edd1e574164131ddd49544bc73a757b351ed91",
+    "contract_version": "1.0.0",
+    "transform_version": "1.0.0"
+  },
+  "config": {
+    "min_intervals": 2,
+    "predictors": [
+      "last interval",
+      "mean of intervals",
+      "median of intervals",
+      "always 14 days"
+    ],
+    "training": "none (rules use only the history known at each cutoff)"
+  },
+  "code": {
+    "commit": "73137bc4e0596d42ef6b50751ac230965c9292ef",
+    "uncommitted_changes": true
+  },
+  "samples": {
+    "total": 85,
+    "scored": 75,
+    "skipped_too_little_history": 10
+  },
+  "results": {
+    "last interval": {
+      "overall": {
+        "n": 75,
+        "mae": 1.1467,
+        "median_ae": 1.0,
+        "bias": -0.1333,
+        "within_1_day": 0.72
+      },
+      "per_product": {
+        "Eggs": {
+          "n": 23,
+          "mae": 0.913,
+          "median_ae": 1.0,
+          "bias": -0.0435,
+          "within_1_day": 0.8261
+        },
+        "Milk": {
+          "n": 34,
+          "mae": 1.1176,
+          "median_ae": 1.0,
+          "bias": -0.1176,
+          "within_1_day": 0.7059
+        },
+        "Rice": {
+          "n": 9,
+          "mae": 0.7778,
+          "median_ae": 1.0,
+          "bias": -0.1111,
+          "within_1_day": 0.8889
+        },
+        "Sugar": {
+          "n": 6,
+          "mae": 1.8333,
+          "median_ae": 1.5,
+          "bias": -0.1667,
+          "within_1_day": 0.5
+        },
+        "Olive oil": {
+          "n": 3,
+          "mae": 3.0,
+          "median_ae": 3.0,
+          "bias": -1.0,
+          "within_1_day": 0.0
+        }
+      }
+    },
+    "mean of intervals": {
+      "overall": {
+        "n": 75,
+        "mae": 0.9333,
+        "median_ae": 1.0,
+        "bias": -0.1867,
+        "within_1_day": 0.8133
+      },
+      "per_product": {
+        "Eggs": {
+          "n": 23,
+          "mae": 0.7391,
+          "median_ae": 1.0,
+          "bias": 0.0435,
+          "within_1_day": 0.913
+        },
+        "Milk": {
+          "n": 34,
+          "mae": 0.8529,
+          "median_ae": 1.0,
+          "bias": -0.0294,
+          "within_1_day": 0.8235
+        },
+        "Rice": {
+          "n": 9,
+          "mae": 0.8889,
+          "median_ae": 1.0,
+          "bias": -0.4444,
+          "within_1_day": 0.8889
+        },
+        "Sugar": {
+          "n": 6,
+          "mae": 1.6667,
+          "median_ae": 1.5,
+          "bias": -1.0,
+          "within_1_day": 0.5
+        },
+        "Olive oil": {
+          "n": 3,
+          "mae": 2.0,
+          "median_ae": 2.0,
+          "bias": -1.3333,
+          "within_1_day": 0.3333
+        }
+      }
+    },
+    "median of intervals": {
+      "overall": {
+        "n": 75,
+        "mae": 0.8933,
+        "median_ae": 1.0,
+        "bias": -0.1733,
+        "within_1_day": 0.8267
+      },
+      "per_product": {
+        "Eggs": {
+          "n": 23,
+          "mae": 0.6957,
+          "median_ae": 1.0,
+          "bias": 0.087,
+          "within_1_day": 0.913
+        },
+        "Milk": {
+          "n": 34,
+          "mae": 0.8235,
+          "median_ae": 1.0,
+          "bias": 0.0,
+          "within_1_day": 0.8529
+        },
+        "Rice": {
+          "n": 9,
+          "mae": 0.8889,
+          "median_ae": 1.0,
+          "bias": -0.4444,
+          "within_1_day": 0.8889
+        },
+        "Sugar": {
+          "n": 6,
+          "mae": 1.5,
+          "median_ae": 1.5,
+          "bias": -0.8333,
+          "within_1_day": 0.5
+        },
+        "Olive oil": {
+          "n": 3,
+          "mae": 2.0,
+          "median_ae": 3.0,
+          "bias": -2.0,
+          "within_1_day": 0.3333
+        }
+      }
+    },
+    "always 14 days": {
+      "overall": {
+        "n": 75,
+        "mae": 7.6133,
+        "median_ae": 8.0,
+        "bias": 5.0267,
+        "within_1_day": 0.1067
+      },
+      "per_product": {
+        "Eggs": {
+          "n": 23,
+          "mae": 7.087,
+          "median_ae": 7.0,
+          "bias": 7.087,
+          "within_1_day": 0.0
+        },
+        "Milk": {
+          "n": 34,
+          "mae": 9.0588,
+          "median_ae": 9.0,
+          "bias": 9.0588,
+          "within_1_day": 0.0
+        },
+        "Rice": {
+          "n": 9,
+          "mae": 0.7778,
+          "median_ae": 1.0,
+          "bias": -0.1111,
+          "within_1_day": 0.8889
+        },
+        "Sugar": {
+          "n": 6,
+          "mae": 7.5,
+          "median_ae": 7.0,
+          "bias": -7.5,
+          "within_1_day": 0.0
+        },
+        "Olive oil": {
+          "n": 3,
+          "mae": 16.0,
+          "median_ae": 17.0,
+          "bias": -16.0,
+          "within_1_day": 0.0
+        }
+      }
+    },
+    "best constant per product (uses the future)": {
+      "overall": {
+        "n": 75,
+        "mae": 0.7867,
+        "median_ae": 1.0,
+        "bias": 0.04,
+        "within_1_day": 0.84
+      },
+      "per_product": {
+        "Eggs": {
+          "n": 23,
+          "mae": 0.6957,
+          "median_ae": 1.0,
+          "bias": 0.087,
+          "within_1_day": 0.913
+        },
+        "Milk": {
+          "n": 34,
+          "mae": 0.7647,
+          "median_ae": 1.0,
+          "bias": 0.0588,
+          "within_1_day": 0.8529
+        },
+        "Rice": {
+          "n": 9,
+          "mae": 0.7778,
+          "median_ae": 1.0,
+          "bias": -0.1111,
+          "within_1_day": 0.8889
+        },
+        "Sugar": {
+          "n": 6,
+          "mae": 1.1667,
+          "median_ae": 1.0,
+          "bias": -0.5,
+          "within_1_day": 0.5
+        },
+        "Olive oil": {
+          "n": 3,
+          "mae": 1.0,
+          "median_ae": 0.0,
+          "bias": 1.0,
+          "within_1_day": 0.6667
+        }
+      }
+    }
+  }
+}

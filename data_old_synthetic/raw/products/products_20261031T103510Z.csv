@@ -1,0 +1,6 @@
+id,name,normalized_name,default_unit,category,created_at,is_active
+11,Eggs,eggs,piece,dairy,2026-10-31T06:12:15.916374+00:00,true
+12,Milk,milk,liter,dairy,2026-10-31T06:12:15.916374+00:00,true
+13,Rice,rice,kg,grains,2026-10-31T06:12:15.916374+00:00,true
+14,Sugar,sugar,kg,pantry,2026-10-31T06:12:15.916374+00:00,true
+15,Olive oil,olive oil,liter,pantry,2026-10-31T06:12:15.916374+00:00,true

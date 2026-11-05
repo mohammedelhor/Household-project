@@ -28,14 +28,19 @@ from backend.app.services import suggestions as service
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)      # today = Nov 1
 
 
-def entry(product_id, name, expected, gap=5, confidence="high", gaps_used=8):
-    return {"product_id": product_id, "product_name": name,
+def entry(product_id, name, expected, gap=5, history_strength="long", gaps_used=8,
+          scope=("user", 1)):
+    """One published suggestion. The default scope is the personal scope of the
+    first user created in a test (the `me` fixture)."""
+    return {"scope_type": scope[0], "scope_id": scope[1],
+            "product_id": product_id, "product_name": name,
             "last_purchase_date": "2026-10-20" if expected else None,
             "typical_gap_days": gap if expected else None,
-            "expected_date": expected, "confidence": confidence, "gaps_used": gaps_used}
+            "expected_date": expected, "history_strength": history_strength,
+            "gaps_used": gaps_used}
 
 
-def file_payload(*entries, generated_at=NOW, schema_version=1):
+def file_payload(*entries, generated_at=NOW, schema_version=2):
     return {"schema_version": schema_version, "generated_at": generated_at.isoformat(),
             "as_of_date": generated_at.date().isoformat(),
             "dataset": {"run_id": "986445dca14a", "input_fingerprint": "f" * 64},
@@ -105,7 +110,7 @@ def test_status_and_days_are_worked_out_from_today(client):
 def test_most_urgent_first_and_unknown_last(client):
     http, path = client
     publish(path, file_payload(
-        entry(1, "Sugar", "2026-11-10"), entry(2, "Olive oil", None, confidence="none", gaps_used=0),
+        entry(1, "Sugar", "2026-11-10"), entry(2, "Olive oil", None, history_strength="none", gaps_used=0),
         entry(3, "Milk", "2026-10-30"), entry(4, "Eggs", "2026-11-03")))
     names = [s["product_name"] for s in http.get("/api/v1/suggestions").json()["suggestions"]]
     assert names == ["Milk", "Eggs", "Sugar", "Olive oil"]
@@ -113,7 +118,7 @@ def test_most_urgent_first_and_unknown_last(client):
 
 def test_a_product_without_rhythm_is_unknown(client):
     http, path = client
-    publish(path, file_payload(entry(1, "Olive oil", None, confidence="none", gaps_used=0)))
+    publish(path, file_payload(entry(1, "Olive oil", None, history_strength="none", gaps_used=0)))
     s = http.get("/api/v1/suggestions").json()["suggestions"][0]
     assert (s["status"], s["days_until"], s["expected_date"]) == ("unknown", None, None)
 
@@ -153,8 +158,9 @@ def test_missing_file_gives_503_without_leaking_the_path(client):
 
 @pytest.mark.parametrize("content", [
     "not json at all",
-    json.dumps({"schema_version": 1}),                                       # wrong shape
-    json.dumps(file_payload(schema_version=2)),                              # unknown version
+    json.dumps({"schema_version": 2}),                                       # wrong shape
+    json.dumps(file_payload(schema_version=1)),                              # the old format
+    json.dumps(file_payload(schema_version=3)),                              # a future format
     json.dumps({**file_payload(), "suggestions": [{"product_id": "x"}]}),    # bad entry
 ])
 def test_unreadable_or_unknown_files_give_503(client, content):
@@ -253,7 +259,6 @@ def test_another_users_personal_list_is_never_visible(client, db, me):
 
 def test_a_household_list_counts_only_for_members(client, db, me):
     http, path = client
-    publish(path, file_payload(entry(1, "Milk", "2026-11-02")))
     other, stranger = make_user(db, "other@example.com"), make_user(db, "stranger@example.com")
     family, strangers = Household(name="Family"), Household(name="Strangers")
     db.add_all([family, strangers])
@@ -265,6 +270,7 @@ def test_a_household_list_counts_only_for_members(client, db, me):
     private_to_others = ShoppingList(household_id=strangers.id, name="Others")
     db.add_all([shared, private_to_others])
     db.commit()
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02", scope=("household", family.id))))
 
     add_item(db, private_to_others, 1)                       # not my household
     assert http.get("/api/v1/suggestions").json()["suggestions"][0]["already_on_list"] is False
@@ -274,7 +280,75 @@ def test_a_household_list_counts_only_for_members(client, db, me):
     assert s["already_on_list"] is True and s["on_list_id"] == shared.id
 
 
-def test_free_text_items_are_ignored_and_the_oldest_item_picks_the_list(db, me):
+# ------------------- scopes: whose suggestions the user may see -------------------
+
+def household_with(db, *users):
+    household = Household(name="Family")
+    db.add(household)
+    db.commit()
+    db.add_all([HouseholdMember(household_id=household.id, user_id=u.id, role="member")
+                for u in users])
+    db.commit()
+    return household
+
+
+def test_the_user_sees_their_own_scope_and_their_households_only(client, db, me):
+    http, path = client
+    mine = household_with(db, me)
+    other_user = make_user(db, "other@example.com")
+    strangers = Household(name="Strangers")
+    db.add(strangers)
+    db.commit()
+    db.add(HouseholdMember(household_id=strangers.id, user_id=other_user.id, role="owner"))
+    db.commit()
+    publish(path, file_payload(
+        entry(1, "Milk", "2026-11-02", scope=("user", me.id)),
+        entry(1, "Milk", "2026-11-03", scope=("household", mine.id)),
+        entry(1, "Milk", "2026-11-04", scope=("household", strangers.id)),    # another family
+        entry(1, "Milk", "2026-11-05", scope=("user", other_user.id)),         # another person
+    ))
+    body = http.get("/api/v1/suggestions").json()["suggestions"]
+
+    assert sorted((s["scope_type"], s["scope_id"]) for s in body) == \
+        sorted([("user", me.id), ("household", mine.id)])
+
+
+def test_another_scopes_data_never_appears_even_when_nothing_is_mine(client, db, me):
+    http, path = client
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02", scope=("household", 999))))
+    assert http.get("/api/v1/suggestions").json()["suggestions"] == []
+
+
+def test_a_waiting_item_marks_only_its_own_scope(client, db, me):
+    http, path = client
+    family = household_with(db, me)
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02", scope=("user", me.id)),
+                               entry(1, "Milk", "2026-11-03", scope=("household", family.id))))
+    shared = ShoppingList(household_id=family.id, name="Shared")
+    db.add(shared)
+    db.commit()
+    add_item(db, shared, 1)                                  # waiting on the HOUSEHOLD list only
+
+    got = {s["scope_type"]: s for s in http.get("/api/v1/suggestions").json()["suggestions"]}
+    assert got["household"]["already_on_list"] is True
+    assert got["user"]["already_on_list"] is False
+
+
+def test_the_response_carries_history_strength_not_confidence(client):
+    http, path = client
+    publish(path, file_payload(entry(1, "Milk", "2026-11-02", history_strength="moderate")))
+    s = http.get("/api/v1/suggestions").json()["suggestions"][0]
+    assert s["history_strength"] == "moderate" and "confidence" not in s
+
+
+def test_user_scopes_are_personal_plus_household(db, me):
+    from backend.app.services.suggestion_lists import user_scopes
+    assert user_scopes(db, me.id) == {("user", me.id)}
+    family = household_with(db, me)
+    assert user_scopes(db, me.id) == {("user", me.id), ("household", family.id)}
+
+
+def test_free_text_items_are_ignored_and_each_scope_keeps_its_own_oldest_list(db, me):
     first, second = personal_list(db, me), None
     free = ShoppingListItem(list_id=first.id, product_id=None, product_name="Milk",
                             quantity=1, unit="piece", status="needed")
@@ -291,7 +365,10 @@ def test_free_text_items_are_ignored_and_the_oldest_item_picks_the_list(db, me):
     db.commit()
     add_item(db, second, 1)                                  # older item: shared list
     add_item(db, first, 1)                                   # newer item: personal list
-    assert products_waiting_on_lists(db, me.id) == {1: second.id}
+    assert products_waiting_on_lists(db, me.id) == {
+        ("household", household.id): {1: second.id},         # each scope keeps its own answer
+        ("user", me.id): {1: first.id},
+    }
 
 
 def test_missing_file_is_still_503_even_with_lists(client, db, me):

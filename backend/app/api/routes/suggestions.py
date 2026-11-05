@@ -8,7 +8,7 @@ from backend.app.core.config import settings
 from backend.app.db.database import get_db
 from backend.app.db.models import User
 from backend.app.schemas.suggestions import SuggestionsRead
-from backend.app.services.suggestion_lists import products_waiting_on_lists
+from backend.app.services.suggestion_lists import products_waiting_on_lists, user_scopes
 from backend.app.services.suggestions import (
     SuggestionsUnavailableError,
     load_suggestions,
@@ -34,6 +34,7 @@ def read_suggestions(
             today=now.date(),            # UTC date, like every date in the data layer
             now=now,
             stale_after_days=settings.suggestions_stale_after_days,
+            allowed_scopes=user_scopes(db, current_user.id),
             waiting=products_waiting_on_lists(db, current_user.id),
         )
     except SuggestionsUnavailableError:

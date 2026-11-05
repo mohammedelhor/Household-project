@@ -1,0 +1,41 @@
+{
+  "run_id": "2435394d812b",
+  "created_at": "2026-11-01T05:18:39.618643+00:00",
+  "transform_version": "1.0.0",
+  "contract_version": "1.0.0",
+  "code": {
+    "commit": "5c1c8b32f5cd008169c584ed585b1b2987c39aa1",
+    "uncommitted_changes": true,
+    "source_fingerprint": "def11342a3e7181d"
+  },
+  "rules": [
+    "R1 each event is valid on its own (type, positive quantity, supported unit)",
+    "R2 all events of an item agree on list, product, quantity and unit",
+    "R3 the item's state sequence is possible (added first, no purchase twice in a row, nothing after archived)",
+    "R4 a repeated event id must be an identical copy, otherwise both items are rejected",
+    "R5 an item is a purchase only if it is still bought at the end of its history",
+    "R6 an inconsistent item is rejected as a whole"
+  ],
+  "inputs": {
+    "fingerprint": "10650624a6efdd65a8c0d30e74edd1e574164131ddd49544bc73a757b351ed91",
+    "event_files": [
+      {
+        "name": "item_events_000000047_000000299.csv",
+        "sha256": "9883fe2acad66b1c9e5f00847d567e2cc62e843768a11e6c18d1f5a983b2c867",
+        "extracted_at": "2026-10-31T10:11:18.275132+00:00"
+      }
+    ],
+    "products_snapshot": {
+      "name": "products_20261101T045537Z.csv",
+      "sha256": "96840c7aaa374daa1aaf060fc84e5a3bcc6c5108501a5e890eed59b6f1d89f43"
+    }
+  },
+  "counts": {
+    "events_read": 253,
+    "duplicates_ignored": 0,
+    "conflicts": 0,
+    "events_quarantined": 0,
+    "purchases": 90,
+    "intervals": 85
+  }
+}

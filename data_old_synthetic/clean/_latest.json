@@ -1,0 +1,9 @@
+{
+  "run_id": "986445dca14a",
+  "published_at": "2026-11-01T15:27:10.285326+00:00",
+  "files": [
+    "purchase_intervals.csv",
+    "purchases.csv",
+    "quarantine.csv"
+  ]
+}

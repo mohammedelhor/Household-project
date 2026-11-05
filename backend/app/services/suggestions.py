@@ -9,10 +9,15 @@ even if the ML layer is rewritten, as long as the file keeps its shape.
 
 WHAT IS WORKED OUT HERE
 -----------------------
-`waiting` (product id -> list id) comes from the caller: it describes the
-user's current lists, which change all day, so it is never read from the file.
+`allowed_scopes` and `waiting` come from the caller. The file holds the
+suggestions of EVERY scope; a user may see only their own personal scope and
+their household's, so everything else is dropped here before anything is
+returned (a test checks that another family's data never leaks).
+`waiting` (scope -> product id -> list id) describes the user's current lists,
+which change all day, so it is never read from the file.
 
-The file holds the stable facts (expected DATE, typical gap, confidence).
+The file holds the stable facts (expected DATE, typical gap, history_strength,
+which only says how much history there was, never how likely the guess is).
 `days_until` and `status` depend on today, so they are computed per request.
 The rule below intentionally repeats ml.suggest.status_for (a tiny function is
 cheaper than a shared package); a unit test fails if the two ever disagree.
@@ -26,7 +31,7 @@ from pydantic import BaseModel, ValidationError
 
 from backend.app.schemas.suggestions import SuggestionRead, SuggestionsRead
 
-SUPPORTED_SCHEMA_VERSION = 1
+SUPPORTED_SCHEMA_VERSION = 2      # v2: scope fields, `confidence` renamed `history_strength`
 SOON_DAYS = 2
 
 
@@ -39,12 +44,14 @@ class _Dataset(BaseModel):
 
 
 class _Entry(BaseModel):
+    scope_type: str
+    scope_id: int
     product_id: int
     product_name: str
     last_purchase_date: date | None
     typical_gap_days: int | None
     expected_date: date | None
-    confidence: str
+    history_strength: str
     gaps_used: int
 
 
@@ -68,7 +75,8 @@ def load_suggestions(
     today: date,
     now: datetime,
     stale_after_days: int,
-    waiting: dict[int, int] | None = None,
+    allowed_scopes: set[tuple[str, int]],
+    waiting: dict[tuple[str, int], dict[int, int]] | None = None,
 ) -> SuggestionsRead:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -85,6 +93,9 @@ def load_suggestions(
     waiting = waiting or {}
     items: list[SuggestionRead] = []
     for entry in parsed.suggestions:
+        scope = (entry.scope_type, entry.scope_id)
+        if scope not in allowed_scopes:
+            continue                      # another family's data: never returned
         if entry.expected_date is None:
             days_until, status = None, "unknown"
         else:
@@ -92,12 +103,13 @@ def load_suggestions(
             status = status_for(days_until)
         items.append(SuggestionRead(
             **entry.model_dump(), days_until=days_until, status=status,
-            already_on_list=entry.product_id in waiting,
-            on_list_id=waiting.get(entry.product_id),
+            already_on_list=entry.product_id in waiting.get(scope, {}),
+            on_list_id=waiting.get(scope, {}).get(entry.product_id),
         ))
 
     # Most urgent first (most overdue = smallest days_until); unknown last.
-    items.sort(key=lambda s: (s.days_until is None, s.days_until or 0, s.product_name))
+    items.sort(key=lambda s: (s.days_until is None, s.days_until or 0, s.product_name,
+                              s.scope_type, s.scope_id))
 
     generated_at = parsed.generated_at
     if generated_at.tzinfo is None:

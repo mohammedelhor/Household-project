@@ -4,7 +4,7 @@ WHY THIS EXISTS
 ---------------
 The data engineering layer reads the application's data. It must be unable to
 change that data, even by accident (a bug, a wrong command). We give it a
-database user that can only SELECT from the two tables it needs. But a
+database user that can only SELECT from the tables it needs (item_events, products, and three owner columns of shopping_lists). But a
 permission we only *believe* we set is not a safety measure, so this script
 proves it: it tries things that must work and things that must be refused.
 
@@ -39,6 +39,12 @@ PERMISSION_DENIED = "42501"
 CHECKS: list[tuple[str, str, bool]] = [
     ("can read item_events", "SELECT count(*) FROM item_events", True),
     ("can read products", "SELECT count(*) FROM products", True),
+    # Only the three columns that say WHOSE a list is (scope of the predictions).
+    # The list's name and the rest stay unreadable: the pipeline does not need them.
+    ("can read the owner columns of shopping_lists",
+     "SELECT id, owner_user_id, household_id FROM shopping_lists LIMIT 1", True),
+    ("cannot read other shopping_lists columns", "SELECT name FROM shopping_lists LIMIT 1", False),
+    ("cannot update shopping_lists", "UPDATE shopping_lists SET owner_user_id = owner_user_id WHERE id = -1", False),
     ("cannot read users (the pipeline does not need emails)", "SELECT count(*) FROM users", False),
     ("cannot delete from item_events", "DELETE FROM item_events WHERE id = -1", False),
     ("cannot update products", "UPDATE products SET name = name WHERE id = -1", False),

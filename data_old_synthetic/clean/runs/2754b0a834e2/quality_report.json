@@ -1,0 +1,97 @@
+{
+  "status": "FAIL",
+  "critical_failures": 1,
+  "warnings": 1,
+  "checks": [
+    {
+      "name": "contract: purchases.csv",
+      "severity": "critical",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "contract: purchase_intervals.csv",
+      "severity": "critical",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "contract: quarantine.csv",
+      "severity": "critical",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "purchase_date matches purchased_at (UTC)",
+      "severity": "critical",
+      "passed": true,
+      "detail": "0 row(s), first items: []"
+    },
+    {
+      "name": "every list used by an event has an owner in the lists snapshot",
+      "severity": "critical",
+      "passed": false,
+      "detail": "lists without an owner: [91]"
+    },
+    {
+      "name": "no list changed owner between lists snapshots",
+      "severity": "critical",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "every purchase carries the scope of its list",
+      "severity": "critical",
+      "passed": true,
+      "detail": "0 row(s), first items: []"
+    },
+    {
+      "name": "every purchase's product exists in the products snapshot",
+      "severity": "critical",
+      "passed": true,
+      "detail": "unknown product ids: []"
+    },
+    {
+      "name": "every interval matches the one derived from the purchases",
+      "severity": "critical",
+      "passed": true,
+      "detail": "0 scope/product group(s) differ; "
+    },
+    {
+      "name": "no purchase is in the future",
+      "severity": "critical",
+      "passed": true,
+      "detail": "0 purchase(s) later than now + 1 day, items: []"
+    },
+    {
+      "name": "less than 50% of events rejected",
+      "severity": "critical",
+      "passed": true,
+      "detail": "43.7% of 579 events rejected"
+    },
+    {
+      "name": "at most 5% of events rejected",
+      "severity": "warning",
+      "passed": false,
+      "detail": "43.7% of 579 events rejected"
+    },
+    {
+      "name": "there is at least one purchase",
+      "severity": "warning",
+      "passed": true,
+      "detail": "no purchases yet: nothing to learn from"
+    },
+    {
+      "name": "purchases did not shrink since the previous run",
+      "severity": "warning",
+      "passed": true,
+      "detail": "98 now vs 90 before (a revert can explain it, an unexplained drop should be looked at)"
+    },
+    {
+      "name": "newest event is recent",
+      "severity": "warning",
+      "passed": true,
+      "detail": "newest event is 0 day(s) old"
+    }
+  ]
+}

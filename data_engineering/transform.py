@@ -55,7 +55,7 @@ import os
 import shutil
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -64,7 +64,9 @@ from backend.app.core.units import SUPPORTED_UNITS
 import backend.app.core.units as units_module
 import data_engineering.contracts as contracts_module
 import data_engineering.quality_gate as quality_gate_module
-from data_engineering.contracts import CONTRACT_VERSION
+import data_engineering.scopes as scopes_module
+from dotenv import load_dotenv
+from data_engineering.contracts import CONTRACT_VERSION, CONTRACTS
 from data_engineering.extract import DEFAULT_OUT_DIR as DEFAULT_RAW_DIR
 from data_engineering.extract import EVENT_COLUMNS, PRODUCT_COLUMNS, render_csv
 from data_engineering.lineage import (
@@ -76,6 +78,7 @@ from data_engineering.lineage import (
     read_previous_purchase_count,
 )
 from data_engineering.quality_gate import run_gate
+from data_engineering.scopes import ListSnapshotError, Scope, load_list_scopes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLEAN_DIR = PROJECT_ROOT / "data" / "clean"
@@ -85,7 +88,7 @@ EVENT_TYPES = frozenset({"added", "purchased", "reverted", "archived"})
 # Recorded in every run's manifest. Bump it when a RULE changes (what counts as
 # a purchase, what gets quarantined), so two runs made with different logic
 # can never be mistaken for each other.
-TRANSFORM_VERSION = "1.0.0"
+TRANSFORM_VERSION = "2.0.0"   # 2.0.0: purchases belong to a scope (household or user)
 # The source files that decide WHAT THE PIPELINE DECIDES. Their content is part
 # of every run's identity (see `logic_identity`), so changing any of them gives
 # a new run even if the numbers come out identical:
@@ -93,11 +96,13 @@ TRANSFORM_VERSION = "1.0.0"
 #   contracts.py     the shape and meaning of the output
 #   quality_gate.py  which data is allowed to be published
 #   units.py         which units are valid (checked by the cleaning AND the contract)
+#   scopes.py        whose history a purchase belongs to (household or user)
 CODE_FILES = (
     Path(__file__),
     Path(contracts_module.__file__),
     Path(quality_gate_module.__file__),
     Path(units_module.__file__),
+    Path(scopes_module.__file__),
 )
 # Project files these ones import but that are deliberately NOT part of the
 # identity, with the reason. A test fails if the logic starts importing a
@@ -114,6 +119,8 @@ RULES = (
     "R4 a repeated event id must be an identical copy, otherwise both items are rejected",
     "R5 an item is a purchase only if it is still bought at the end of its history",
     "R6 an inconsistent item is rejected as a whole",
+    "R7 every item's list must have exactly one owner (household or user) in the lists snapshot; otherwise the item is rejected",
+    "R8 intervals are computed per (scope, product): histories of different scopes are never combined",
 )
 
 
@@ -143,6 +150,7 @@ class Purchase:
     unit: str
     purchased_at: datetime
     source_event_id: int   # the 'purchased' event that created this row (lineage)
+    scope: Scope | None = None   # whose history this is; None only when no lists snapshot was given
 
     @property
     def purchase_date(self) -> date:
@@ -381,10 +389,21 @@ def evaluate_item(events: list[Event]) -> tuple[Purchase | None, str | None]:
 def build_purchases(
     events: list[Event],
     tainted_items: dict[int, str] | None = None,
+    list_scopes: dict[int, Scope] | None = None,
 ) -> tuple[list[Purchase], list[Quarantined]]:
-    """Group events by item, replay each, collect purchases and rejects."""
+    """Group events by item, replay each, collect purchases and rejects.
+
+    With `list_scopes` (list id -> scope) every purchase gets the scope of its
+    list, and an item whose list has no scope is rejected: a scope is never
+    guessed and never defaults to a shared "global" one.
+    """
     tainted = dict(tainted_items or {})
     quarantined: list[Quarantined] = []
+
+    if list_scopes is not None:
+        for event in events:
+            if event.list_id not in list_scopes and event.item_id not in tainted:
+                tainted[event.item_id] = f"list {event.list_id} has no owner in the lists snapshot"
 
     # Rule 1: single-event checks. One bad event taints its whole item.
     for event in events:
@@ -415,6 +434,8 @@ def build_purchases(
                 Quarantined(e.id, item_id, reason) for e in item_events
             )
         elif purchase is not None:
+            if list_scopes is not None:
+                purchase = replace(purchase, scope=list_scopes[purchase.list_id])
             purchases.append(purchase)
 
     purchases.sort(key=lambda p: (p.purchased_at, p.item_id))
@@ -429,18 +450,29 @@ def compute_intervals(
     purchases: list[Purchase],
     names: dict[int, tuple[str, str]],
 ) -> list[dict]:
-    """Days between consecutive purchases of the same product."""
-    by_product: dict[int, list[Purchase]] = defaultdict(list)
+    """Days between consecutive purchases of the same product BY THE SAME SCOPE.
+
+    The grouping key is (scope, product), never the product alone: two
+    households that buy milk at different rhythms must not produce a
+    combined interval series. Every purchase must therefore carry its scope.
+    """
+    groups: dict[tuple[Scope, int], list[Purchase]] = defaultdict(list)
     for purchase in purchases:
-        if purchase.product_id is not None:  # custom items have no product
-            by_product[purchase.product_id].append(purchase)
+        if purchase.product_id is None:      # custom items have no product
+            continue
+        if purchase.scope is None:
+            raise ValueError(f"purchase of item {purchase.item_id} has no scope: "
+                             "build the purchases with the lists snapshot")
+        groups[(purchase.scope, purchase.product_id)].append(purchase)
 
     rows = []
-    for product_id, items in by_product.items():
-        items.sort(key=lambda p: p.purchased_at)
+    for (scope, product_id), items in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        items.sort(key=lambda p: (p.purchased_at, p.item_id))
         label = names.get(product_id, (f"product {product_id}", ""))[0]
         for previous, current in zip(items, items[1:]):
             rows.append({
+                "scope_type": scope.type,
+                "scope_id": scope.id,
                 "product_id": product_id,
                 "product_name": label,
                 "previous_purchase_date": previous.purchase_date,
@@ -450,43 +482,59 @@ def compute_intervals(
     return rows
 
 
-def summarise_by_product(
+def summarise_by_scope(
     purchases: list[Purchase],
     intervals: list[dict],
     names: dict[int, tuple[str, str]],
-) -> dict[str, dict]:
-    """normalized name -> {name, purchases, intervals_days}, for reporting
-    and for the comparison with the answer key."""
-    summary: dict[str, dict] = {}
-    for product_id, (name, normalized) in names.items():
-        summary[normalized] = {
-            "name": name,
-            "purchases": sum(1 for p in purchases if p.product_id == product_id),
-            "intervals_days": [
-                r["days_since_previous"] for r in intervals if r["product_id"] == product_id
-            ],
-        }
+) -> dict[str, dict[str, dict]]:
+    """scope key -> normalized product name -> {name, purchases, intervals_days}.
+    Used for reporting and for the comparison with the answer key. Only the
+    products a scope really bought appear under it."""
+    summary: dict[str, dict[str, dict]] = {}
+    for purchase in purchases:
+        if purchase.product_id is None or purchase.scope is None:
+            continue
+        name, normalized = names.get(purchase.product_id, (f"product {purchase.product_id}", ""))
+        entry = summary.setdefault(purchase.scope.key, {}).setdefault(
+            normalized, {"name": name, "purchases": 0, "intervals_days": []})
+        entry["purchases"] += 1
+    for row in intervals:
+        scope_key = Scope(row["scope_type"], row["scope_id"]).key
+        _, normalized = names.get(row["product_id"], ("", ""))
+        summary[scope_key][normalized]["intervals_days"].append(row["days_since_previous"])
     return summary
 
 
-def compare_with_truth(summary: dict[str, dict], truth: dict) -> list[dict]:
-    """Compare what the pipeline found with the generator's answer key."""
+def compare_with_truth(summary: dict[str, dict[str, dict]], truth: dict) -> list[dict]:
+    """Compare what the pipeline found with the generator's answer key, per
+    (scope, product). A scope the key lists but the pipeline never saw is a
+    failure, and so is a scope the pipeline found that the key does not know."""
+    if "scopes" not in truth:
+        return [{"product": "answer key", "ok": False,
+                 "detail": "the answer key has no scopes (old format): regenerate it "
+                           "with `uv run python -m data_engineering.synthetic_data`"}]
     results = []
-    for name, expected in truth["products"].items():
-        found = summary.get(name.strip().casefold())
-        if found is None:
-            results.append({"product": name, "ok": False, "detail": "product not found"})
-            continue
-        same_count = found["purchases"] == expected["purchases"]
-        same_intervals = found["intervals_days"] == expected["intervals_days"]
-        results.append({
-            "product": name,
-            "ok": same_count and same_intervals,
-            "detail": (
-                f"purchases {found['purchases']}/{expected['purchases']}, "
-                f"intervals {'identical' if same_intervals else 'DIFFER'}"
-            ),
-        })
+    for scope_key, scope_truth in truth["scopes"].items():
+        found_scope = summary.get(scope_key, {})
+        for name, expected in scope_truth["products"].items():
+            label = f"{scope_key} {name}"
+            found = found_scope.get(name.strip().casefold())
+            if found is None:
+                results.append({"product": label, "ok": False, "detail": "product not found"})
+                continue
+            same_count = found["purchases"] == expected["purchases"]
+            same_intervals = found["intervals_days"] == expected["intervals_days"]
+            results.append({
+                "product": label,
+                "ok": same_count and same_intervals,
+                "detail": (
+                    f"purchases {found['purchases']}/{expected['purchases']}, "
+                    f"intervals {'identical' if same_intervals else 'DIFFER'}"
+                ),
+            })
+    for scope_key in sorted(set(summary) - set(truth["scopes"])):
+        results.append({"product": scope_key, "ok": False,
+                        "detail": "scope found in the data but not in the answer key"})
     return results
 
 
@@ -641,6 +689,7 @@ def run(
     truth_path: Path | None = None,
     *,
     now: datetime | None = None,
+    data_origin: str = "unknown",
 ) -> int:
     """Clean the raw files and report. Returns 0 on success, 1 on a problem
     (no input, quality gate FAIL, conflicting duplicates, or a mismatch with
@@ -650,7 +699,8 @@ def run(
     try:
         events, unparsed, stats = load_events(raw_dir)
         names = load_product_names(raw_dir)
-    except RawDataError as exc:
+        scopes = load_list_scopes(raw_dir) if stats["files"] else None
+    except (RawDataError, ListSnapshotError) as exc:
         # Nothing is published: the previous good run stays the latest.
         print(f"RAW DATA ERROR: {exc}\nNothing was published; the latest published run is unchanged.")
         return 1
@@ -660,30 +710,40 @@ def run(
 
     # An unparseable event makes its item untrustworthy too.
     tainted = {q.item_id: q.reason for q in unparsed if q.item_id is not None}
-    purchases, quarantined = build_purchases(events, tainted)
+
+    # Whose history is each item? A list without a valid owner cannot be
+    # scoped, and a scope is never guessed: its items are rejected as a whole.
+    unresolved_lists: set[int] = set()
+    for event in events:
+        if event.list_id not in scopes.by_list:
+            unresolved_lists.add(event.list_id)
+            why = scopes.invalid.get(event.list_id, "it is not in the lists snapshot")
+            tainted.setdefault(event.item_id, f"list {event.list_id} has no owner: {why}")
+
+    purchases, quarantined = build_purchases(events, tainted, scopes.by_list)
     quarantined = unparsed + [q for q in quarantined if q not in unparsed]
 
     intervals = compute_intervals(purchases, names)
-    summary = summarise_by_product(purchases, intervals, names)
+    summary = summarise_by_scope(purchases, intervals, names)
 
     # Render all three files in memory first, then judge them, then publish.
     tables = {
+        # Column names come from the contract: one place defines them.
         "purchases.csv": render_csv(
-            ("item_id", "product_id", "product_name", "list_id", "quantity",
-             "unit", "purchased_at", "purchase_date", "source_event_id"),
+            CONTRACTS["purchases.csv"].column_names,
             [
                 {**vars(p), "purchase_date": p.purchase_date,
+                 "scope_type": p.scope.type, "scope_id": p.scope.id,
                  "product_name": names.get(p.product_id, ("", ""))[0]}
                 for p in purchases
             ],
         ),
         "purchase_intervals.csv": render_csv(
-            ("product_id", "product_name", "previous_purchase_date",
-             "purchase_date", "days_since_previous"),
+            CONTRACTS["purchase_intervals.csv"].column_names,
             intervals,
         ),
         "quarantine.csv": render_csv(
-            ("event_id", "item_id", "reason"),
+            CONTRACTS["quarantine.csv"].column_names,
             [vars(q) for q in quarantined],
         ),
     }
@@ -708,7 +768,7 @@ def run(
             "intervals": len(intervals),
         },
         rules=RULES, transform_version=TRANSFORM_VERSION,
-        contract_version=CONTRACT_VERSION, code=code,
+        contract_version=CONTRACT_VERSION, code=code, data_origin=data_origin,
     )
 
     # The gate: a verdict, not just a report.
@@ -720,6 +780,9 @@ def run(
         newest_event_at=max((e.occurred_at for e in events), default=None),
         previous_purchases=read_previous_purchase_count(out_dir),
         now=now,
+        list_scopes=scopes.by_list,
+        unresolved_list_ids=unresolved_lists,
+        scope_conflicts=scopes.conflicts,
     )
     publish_run(
         out_dir, tables,
@@ -759,12 +822,15 @@ def run(
         print(f"ERROR: {stats['conflicts']} event id(s) appear twice with "
               "DIFFERENT content. Items involved were quarantined; investigate "
               "the source and the extraction.")
-    print(f"{len(purchases)} purchases, {len(quarantined)} event(s) quarantined\n")
-    print(f"{'product':<12}{'purchases':>10}{'avg days':>10}")
-    for entry in summary.values():
-        gaps = entry["intervals_days"]
-        average = f"{sum(gaps) / len(gaps):.2f}" if gaps else "-"
-        print(f"{entry['name']:<12}{entry['purchases']:>10}{average:>10}")
+    print(f"{len(purchases)} purchases, {len(quarantined)} event(s) quarantined, "
+          f"{len(summary)} scope(s), data origin: {data_origin}\n")
+    for scope_key, products in sorted(summary.items()):
+        print(f"[{scope_key}]")
+        print(f"  {'product':<12}{'purchases':>10}{'avg days':>10}")
+        for entry in products.values():
+            gaps = entry["intervals_days"]
+            average = f"{sum(gaps) / len(gaps):.2f}" if gaps else "-"
+            print(f"  {entry['name']:<12}{entry['purchases']:>10}{average:>10}")
 
     if quarantined:
         print("\nQuarantine reasons:")
@@ -772,11 +838,15 @@ def run(
             print(f"  - {reason}")
 
     if truth_path:
+        if not truth_path.exists():
+            print(f"\nThe answer key {truth_path} does not exist. Generate the synthetic "
+                  "data first (it writes the key), or run without --truth.")
+            return 1
         truth = json.loads(truth_path.read_text(encoding="utf-8"))
         results = compare_with_truth(summary, truth)
         print("\nComparison with the answer key:")
         for result in results:
-            print(f"  {'OK  ' if result['ok'] else 'FAIL'} {result['product']:<12}{result['detail']}")
+            print(f"  {'OK  ' if result['ok'] else 'FAIL'} {result['product']:<22}{result['detail']}")
         if not all(r["ok"] for r in results):
             problem = True
 
@@ -784,12 +854,16 @@ def run(
 
 
 def main() -> int:
+    load_dotenv(PROJECT_ROOT / ".env")     # so DATA_ORIGIN can live in .env
     parser = argparse.ArgumentParser(description="Clean raw events into purchases.")
     parser.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW_DIR)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_CLEAN_DIR)
     parser.add_argument("--truth", type=Path, help="answer key to compare against")
+    parser.add_argument("--data-origin", choices=("real", "synthetic", "unknown"),
+                        default=os.getenv("DATA_ORIGIN", "unknown"),
+                        help="what the data is (also read from DATA_ORIGIN); recorded in the manifest")
     args = parser.parse_args()
-    return run(args.raw_dir, args.out_dir, args.truth)
+    return run(args.raw_dir, args.out_dir, args.truth, data_origin=args.data_origin)
 
 
 if __name__ == "__main__":

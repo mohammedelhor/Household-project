@@ -59,15 +59,24 @@ def describe_inputs(raw_dir: Path) -> dict:
     products = (
         {"name": snapshots[-1].name, "sha256": sha256_file(snapshots[-1])} if snapshots else None
     )
+    # EVERY lists snapshot counts, not only the newest: the cleaning checks
+    # that no list changed owner between snapshots, so the older ones are
+    # inputs too. They count by CONTENT only (names are timestamps).
+    list_snapshots = [
+        {"name": p.name, "sha256": sha256_file(p)}
+        for p in sorted((raw_dir / "shopping_lists").glob("shopping_lists_*.csv"))
+    ]
     # One hash over all of it: the identity of the input as a whole. Event
     # files count by name AND content (the name carries the id range). The
     # products snapshot counts by CONTENT only: its name is just a timestamp,
     # and a re-saved copy with identical rows is the same input.
     combined = hashlib.sha256(
         json.dumps([[f["name"], f["sha256"]] for f in event_files]
-                   + [products["sha256"] if products else None]).encode()
+                   + [products["sha256"] if products else None]
+                   + [["lists", [s["sha256"] for s in list_snapshots]]]).encode()
     ).hexdigest()
-    return {"fingerprint": combined, "event_files": event_files, "products_snapshot": products}
+    return {"fingerprint": combined, "event_files": event_files,
+            "products_snapshot": products, "list_snapshots": list_snapshots}
 
 
 def code_file_hashes(paths: list[Path]) -> dict[str, str]:
@@ -124,9 +133,15 @@ def build_manifest(
     transform_version: str,
     contract_version: str,
     code: dict,
+    data_origin: str = "unknown",
 ) -> dict:
+    """`data_origin` says whether the numbers describe real households or
+    generated ones ("real", "synthetic" or "unknown"). It is a LABEL about the
+    run, not part of its identity, and every report repeats it: results on
+    synthetic data verify the code, never real-world performance."""
     return {
         "run_id": run_id,
+        "data_origin": data_origin,
         "created_at": created_at.isoformat(),
         "transform_version": transform_version,
         "contract_version": contract_version,

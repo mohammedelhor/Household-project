@@ -14,6 +14,7 @@ import pytest
 
 from data_engineering import transform
 from data_engineering.extract import EVENT_COLUMNS, PRODUCT_COLUMNS, write_csv_atomic
+from data_engineering.scopes import LIST_COLUMNS, Scope, load_list_scopes
 from data_engineering.synthetic_data import PRODUCT_PROFILES, build_ground_truth, generate_history
 from data_engineering.transform import (
     Event,
@@ -28,11 +29,19 @@ from data_engineering.transform import (
     load_events,
     load_product_names,
     parse_event,
-    summarise_by_product,
+    summarise_by_scope,
     validate_event,
 )
 
 T0 = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
+
+HOUSEHOLD_1 = Scope("household", 1)      # the scope every test list belongs to by default
+
+
+def write_lists_snapshot(raw_dir, rows=None, name="shopping_lists_20261031T000000Z.csv"):
+    """The lists snapshot extract.py writes: list 1 belongs to household 1 unless told otherwise."""
+    rows = rows if rows is not None else [{"id": 1, "owner_user_id": None, "household_id": 1}]
+    write_csv_atomic(raw_dir / "shopping_lists" / name, LIST_COLUMNS, rows)
 
 
 def ev(event_id, kind, minutes=0, item_id=1, product_id=1, quantity="2", unit="kg",
@@ -246,10 +255,10 @@ def test_unparseable_rows_taint_their_item():
 
 # ------------------------------ intervals ------------------------------
 
-def purchase(day, product_id=1):
+def purchase(day, product_id=1, scope=HOUSEHOLD_1):
     return Purchase(item_id=day, product_id=product_id, list_id=1, quantity=Decimal(1),
                     unit="kg", purchased_at=datetime(2026, 10, day, 10, tzinfo=timezone.utc),
-                    source_event_id=day)
+                    source_event_id=day, scope=scope)
 
 
 def test_intervals_are_whole_days_between_purchase_dates():
@@ -264,10 +273,10 @@ def test_intervals_ignore_hours_and_do_not_mix_products():
     names = {1: ("Rice", "rice"), 2: ("Milk", "milk")}
     late = Purchase(item_id=9, product_id=1, list_id=1, quantity=Decimal(1), unit="kg",
                     purchased_at=datetime(2026, 10, 3, 23, 59, tzinfo=timezone.utc),
-                    source_event_id=9)
+                    source_event_id=9, scope=HOUSEHOLD_1)
     early = Purchase(item_id=8, product_id=1, list_id=1, quantity=Decimal(1), unit="kg",
                      purchased_at=datetime(2026, 10, 1, 0, 1, tzinfo=timezone.utc),
-                     source_event_id=8)
+                     source_event_id=8, scope=HOUSEHOLD_1)
 
     rows = compute_intervals([early, late, purchase(5, product_id=2)], names)
 
@@ -303,6 +312,7 @@ def write_raw_files(raw_dir, items):
         raw_dir / "item_events" / f"item_events_{1:09d}_{len(rows):09d}.csv",
         EVENT_COLUMNS, rows,
     )
+    write_lists_snapshot(raw_dir)
     write_csv_atomic(
         raw_dir / "products" / "products_20261031T000000Z.csv",
         PRODUCT_COLUMNS,
@@ -322,10 +332,11 @@ def test_pipeline_reproduces_the_generators_answer_key(tmp_path, mistake_rate):
     write_raw_files(tmp_path, items)
 
     events, unparsed, _ = load_events(tmp_path)
-    purchases, quarantined = build_purchases(events)
+    purchases, quarantined = build_purchases(events, None, load_list_scopes(tmp_path).by_list)
     names = load_product_names(tmp_path)
-    summary = summarise_by_product(purchases, compute_intervals(purchases, names), names)
-    truth = build_ground_truth(items, PRODUCT_PROFILES, end=END, days=180, seed=42)
+    summary = summarise_by_scope(purchases, compute_intervals(purchases, names), names)
+    truth = build_ground_truth(items, end=END, days=180, seed=42,
+                               scope_keys={None: HOUSEHOLD_1.key})
 
     assert unparsed == [] and quarantined == []
     results = compare_with_truth(summary, truth)
@@ -335,7 +346,8 @@ def test_pipeline_reproduces_the_generators_answer_key(tmp_path, mistake_rate):
 def test_pipeline_notices_when_the_data_is_wrong(tmp_path):
     items = generate_history(PRODUCT_PROFILES, end=END, days=180, seed=42)
     write_raw_files(tmp_path, items)
-    truth = build_ground_truth(items, PRODUCT_PROFILES, end=END, days=180, seed=42)
+    truth = build_ground_truth(items, end=END, days=180, seed=42,
+                               scope_keys={None: HOUSEHOLD_1.key})
 
     # Remove one of the rice purchases from the raw file: the comparison must fail.
     path = next((tmp_path / "item_events").glob("*.csv"))
@@ -346,13 +358,13 @@ def test_pipeline_notices_when_the_data_is_wrong(tmp_path):
     write_csv_atomic(path, EVENT_COLUMNS, rows)
 
     events, _, _ = load_events(tmp_path)
-    purchases, _ = build_purchases(events)
+    purchases, _ = build_purchases(events, None, load_list_scopes(tmp_path).by_list)
     names = load_product_names(tmp_path)
-    summary = summarise_by_product(purchases, compute_intervals(purchases, names), names)
+    summary = summarise_by_scope(purchases, compute_intervals(purchases, names), names)
 
     results = {r["product"]: r for r in compare_with_truth(summary, truth)}
-    assert results["Rice"]["ok"] is False
-    assert results["Milk"]["ok"] is True
+    assert results["household:1 Rice"]["ok"] is False
+    assert results["household:1 Milk"]["ok"] is True
 
 
 def test_duplicate_ids_across_files_are_counted_once(tmp_path):
@@ -374,7 +386,7 @@ def test_command_line_writes_files_and_checks_the_answer_key(tmp_path, monkeypat
     write_raw_files(raw, items)
     truth_path = tmp_path / "truth.json"
     truth_path.write_text(json.dumps(
-        build_ground_truth(items, PRODUCT_PROFILES, end=END, days=180, seed=42)
+        build_ground_truth(items, end=END, days=180, seed=42, scope_keys={None: HOUSEHOLD_1.key})
     ))
 
     monkeypatch.setattr("sys.argv", [
@@ -410,6 +422,8 @@ def test_late_batch_files_are_read_like_any_other_batch(tmp_path):
 
 def _write_batch(raw_dir, name, rows):
     write_csv_atomic(raw_dir / "item_events" / name, EVENT_COLUMNS, rows)
+    if not (raw_dir / "shopping_lists").exists():
+        write_lists_snapshot(raw_dir)
 
 
 def _raw_row(event_id, item_id=1, kind="added", product_id=1, quantity="2"):
@@ -765,12 +779,12 @@ def _copies_of_the_code(tmp_path):
     return tuple(copies)
 
 
-def test_the_identity_covers_the_four_files_that_decide_the_pipeline():
+def test_the_identity_covers_the_five_files_that_decide_the_pipeline():
     assert {p.name for p in transform.CODE_FILES} == {
-        "transform.py", "contracts.py", "quality_gate.py", "units.py"}
+        "transform.py", "contracts.py", "quality_gate.py", "units.py", "scopes.py"}
 
 
-@pytest.mark.parametrize("changed", ["transform.py", "contracts.py", "quality_gate.py", "units.py"])
+@pytest.mark.parametrize("changed", ["transform.py", "contracts.py", "quality_gate.py", "units.py", "scopes.py"])
 def test_changing_any_identity_file_changes_the_logic_identity(tmp_path, monkeypatch, changed):
     copies = _copies_of_the_code(tmp_path)
     monkeypatch.setattr(transform, "CODE_FILES", copies)
@@ -810,7 +824,7 @@ def test_the_manifest_records_a_hash_for_every_identity_file(tmp_path):
 
     code = json.loads((latest_clean_dir(clean) / "manifest.json").read_text(encoding="utf-8"))["code"]
 
-    assert set(code["source_files"]) == {"transform.py", "contracts.py", "quality_gate.py", "units.py"}
+    assert set(code["source_files"]) == {"transform.py", "contracts.py", "quality_gate.py", "units.py", "scopes.py"}
     assert all(len(h) == 16 for h in code["source_files"].values())
 
 

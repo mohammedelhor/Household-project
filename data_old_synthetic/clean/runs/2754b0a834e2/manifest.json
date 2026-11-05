@@ -1,0 +1,62 @@
+{
+  "run_id": "2754b0a834e2",
+  "data_origin": "synthetic",
+  "created_at": "2026-11-05T07:18:52.965642+00:00",
+  "transform_version": "2.0.0",
+  "contract_version": "2.0.0",
+  "code": {
+    "commit": "ad4156b848f28e3a52ef012d0cb6d37d12021bad",
+    "uncommitted_changes": true,
+    "source_fingerprint": "d4733bb1fde62bdc",
+    "source_files": {
+      "contracts.py": "2a73395cbe28c111",
+      "quality_gate.py": "15eefcd5874937da",
+      "scopes.py": "884806b6b246a010",
+      "transform.py": "9dd92ecf181c7e8e",
+      "units.py": "731e5aaf44300320"
+    }
+  },
+  "rules": [
+    "R1 each event is valid on its own (type, positive quantity, supported unit)",
+    "R2 all events of an item agree on list, product, quantity and unit",
+    "R3 the item's state sequence is possible (added first, no purchase twice in a row, nothing after archived)",
+    "R4 a repeated event id must be an identical copy, otherwise both items are rejected",
+    "R5 an item is a purchase only if it is still bought at the end of its history",
+    "R6 an inconsistent item is rejected as a whole",
+    "R7 every item's list must have exactly one owner (household or user) in the lists snapshot; otherwise the item is rejected",
+    "R8 intervals are computed per (scope, product): histories of different scopes are never combined"
+  ],
+  "inputs": {
+    "fingerprint": "bef9fdfa36b6530f83a25bf1eb298305c53bbea4567582915f9b04fdd201e363",
+    "event_files": [
+      {
+        "name": "item_events_000000047_000000299.csv",
+        "sha256": "9883fe2acad66b1c9e5f00847d567e2cc62e843768a11e6c18d1f5a983b2c867",
+        "extracted_at": "2026-10-31T10:11:18.275132+00:00"
+      },
+      {
+        "name": "item_events_000000300_000000625.csv",
+        "sha256": "405b6b8986e8eb9597810397230aea069d7c7e577f2126d94e4349651eaf4987",
+        "extracted_at": "2026-11-05T07:13:54.993695+00:00"
+      }
+    ],
+    "products_snapshot": {
+      "name": "products_20261101T045537Z.csv",
+      "sha256": "96840c7aaa374daa1aaf060fc84e5a3bcc6c5108501a5e890eed59b6f1d89f43"
+    },
+    "list_snapshots": [
+      {
+        "name": "shopping_lists_20261105T071852Z.csv",
+        "sha256": "c49b33e397cce074c3af9ff3306c0d378159595d0eb7bba56b21d24debfd0e5e"
+      }
+    ]
+  },
+  "counts": {
+    "events_read": 579,
+    "duplicates_ignored": 0,
+    "conflicts": 0,
+    "events_quarantined": 253,
+    "purchases": 98,
+    "intervals": 93
+  }
+}

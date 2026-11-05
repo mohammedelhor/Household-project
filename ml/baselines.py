@@ -40,7 +40,11 @@ class MeanInterval:
 
 @dataclass(frozen=True)
 class MedianInterval:
-    """Next gap = median of all past gaps. Ignores outliers: the main baseline."""
+    """Next gap = median of all past gaps. Ignores outliers.
+
+    This is the "Historical Median Baseline": the simple rule every later model
+    has to beat. (The label keeps the old name so records stay comparable.)
+    """
     name: str = "median of intervals"
 
     def predict(self, history: tuple[int, ...]) -> float | None:
