@@ -195,3 +195,10 @@ def test_phantoms_are_not_in_the_answer_key():
 def test_the_answer_key_refuses_to_guess_a_scope_name():
     with pytest.raises(TypeError):
         build_ground_truth(_history(), end=END, days=180, seed=42)    # scope_keys is required
+
+
+def test_the_generator_tells_the_user_to_start_from_a_clean_data_folder():
+    """Regenerating changes the database but not the local raw copies; mixing them
+    doubles the households. The hint printed after a write must say what to do."""
+    from data_engineering.synthetic_data import CLEAN_START_HINT
+    assert "data/ folder" in CLEAN_START_HINT and "Rename-Item data" in CLEAN_START_HINT

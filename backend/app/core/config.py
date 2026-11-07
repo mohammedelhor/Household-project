@@ -1,3 +1,4 @@
+
 from pathlib import Path
 from typing import Literal
 
@@ -10,6 +11,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 class Settings(BaseSettings):
     database_url: str
+
+    # Optional safety net: the environment this API is MEANT to talk to
+    # ("dev" on your computer, "production" on the host). When set, the API
+    # asks the database for its label at startup and refuses to start if they
+    # differ, so a wrong DATABASE_URL cannot go unnoticed. Unset = no check.
+    expected_db_environment: Literal["dev", "test", "synthetic", "production"] | None = None
 
     jwt_secret_key: SecretStr
     jwt_algorithm: Literal["HS256"] = "HS256"

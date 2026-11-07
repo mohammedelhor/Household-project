@@ -12,6 +12,12 @@ the transaction that does it:
 Use it for test cleanup and synthetic data, or for a reviewed manual
 correction. Normal application code must NEVER call it: a wrong event is
 fixed by appending a new one.
+
+IMPORTANT: this flag is NOT authorization. It only tells the trigger "this
+change is deliberate". Who is ALLOWED to change events is decided by database
+privileges: the API role (`app_runtime`) has only SELECT and INSERT on
+item_events, so even with the flag on its UPDATE/DELETE is refused. Only the
+owner role (tests, the synthetic generator, a reviewed manual fix) can use it.
 """
 
 from sqlalchemy import text

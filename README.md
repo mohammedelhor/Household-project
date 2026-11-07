@@ -340,6 +340,7 @@ uv run python -m data_engineering.pipeline --truth data_engineering/synthetic_gr
 ```
 
 The generator writes to `SYNTHETIC_DATABASE_URL` and saves an *answer key*; `--truth` makes the pipeline compare its result with the key per scope. Synthetic data verifies the code, not performance on real households. Reports label it clearly.
+After regenerating, the old synthetic rows are gone from the database but the pipeline's `data/raw` still holds its copies on purpose (extraction only ever adds). Move the old folder aside first (`Rename-Item data data_old_synthetic`), otherwise old and new households are counted together and every count is inflated.
 
 ### The contract between ML and the backend
 
@@ -431,6 +432,36 @@ The pipeline's read-only role needs access to three columns of `shopping_lists` 
 ```sql
 GRANT SELECT (id, owner_user_id, household_id) ON shopping_lists TO <readonly_role>;
 ```
+
+### Database roles
+
+Three kinds of connection, each with the weakest role that can do its job:
+
+| Role | Used by | Can do |
+|---|---|---|
+| owner (`neondb_owner`) | migrations, `scripts/setup_roles.py`, tests, the synthetic generator | everything; never used by the running API |
+| `app_runtime` | the API (`DATABASE_URL`) | read/write normal tables; only `SELECT`/`INSERT` on `item_events`; no schema changes; cannot see `alembic_version` |
+| `analytics_reader` | the data pipeline (`SOURCE_DATABASE_URL`) | `SELECT` on `item_events`, `products` and three owner columns of `shopping_lists` |
+
+The trigger's correction flag (`household.allow_event_correction`) is **not** authorization: any role allowed to UPDATE/DELETE could switch it on. Privileges are the boundary, and `scripts/check_app_access.py` proves them (including that the flag does not help `app_runtime`).
+
+```powershell
+uv run python scripts/setup_roles.py dev            # look only
+uv run python scripts/setup_roles.py dev --apply    # create roles + grants (idempotent)
+uv run python scripts/check_app_access.py           # run as the API's role
+```
+
+Put the owner's URL in `OWNER_DATABASE_URL` (used by `scripts/migrate.py` and `setup_roles.py`) and the `app_runtime` URL in `DATABASE_URL`. Create roles with SQL (as the script does), not in the Neon console: console-made roles join `neon_superuser` and bypass table privileges. A new append-only table must be added to `APPEND_ONLY` in `scripts/setup_roles.py` and the script re-run.
+
+### Environment labels
+
+Our databases all look alike (same name, same user), so each one stores its own environment label (`dev`, `test`, `synthetic` or `production`) as a database comment, and dangerous tools ask the **database** who it is instead of trusting the URL: migrations, `setup_roles.py`, the test-suite, the synthetic generator and (when `EXPECTED_DB_ENVIRONMENT` is set) the API at startup. A wrong label stops the tool before anything changes. An unmarked database on this computer (CI, local docker) is accepted; an unmarked remote one is refused.
+
+```powershell
+uv run python scripts/mark_environment.py dev --apply   # once per database (production asks for the host)
+uv run python scripts/inspect_databases.py              # shows each database's label
+```
+
 
 ## 10. Testing
 

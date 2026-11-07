@@ -20,3 +20,6 @@ htmlcov/
 .vscode/
 data/
 data/
+
+data_engineering/synthetic_ground_truth.json
+data_old*/
