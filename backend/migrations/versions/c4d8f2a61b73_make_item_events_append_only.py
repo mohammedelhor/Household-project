@@ -41,10 +41,14 @@ mistake, and the statement that uses it is visible in code review and logs.
 
 HONEST LIMIT
 ------------
-This protects against mistakes, buggy code and casual scripts. Anyone who
-owns the table (or is a superuser) can still drop the trigger or set the flag;
-that cannot be prevented from inside the same database, and is why the data
-pipeline connects with a read-only role (see data_engineering/check_source_access.py).
+The trigger alone protects against mistakes, buggy code and casual scripts.
+It is NOT an access-control boundary: any role that is allowed to UPDATE or
+DELETE the table can also switch the correction flag on, and the owner can
+drop the trigger. The real boundary is PRIVILEGES: the API connects as
+`app_runtime`, which was only ever granted SELECT and INSERT on item_events,
+so PostgreSQL refuses its UPDATE/DELETE whatever flags it sets. The data
+pipeline connects as the read-only `analytics_reader`. Both are set up and
+proven by scripts/setup_roles.py and scripts/check_app_access.py.
 """
 from typing import Sequence, Union
 

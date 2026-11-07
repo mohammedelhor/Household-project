@@ -47,6 +47,7 @@ from sqlalchemy import create_engine, delete, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
+from backend.app.core.db_safety import check_environment
 from backend.app.core.units import SUPPORTED_UNITS
 from backend.app.db.event_admin import allow_event_correction
 from backend.app.db.models import (
@@ -530,6 +531,19 @@ def print_summary(truth: dict, items: list[PlannedItem]) -> None:
             )
 
 
+# Printed after every write. Regenerating deletes the old synthetic rows from the
+# database, but the pipeline's data/raw keeps its copies of them on purpose
+# (the extraction only ever adds). Mixing the two doubles the households and
+# inflates every count, and the answer key no longer matches the data.
+CLEAN_START_HINT = (
+    "NEXT: the old synthetic data is still in your local data/ folder.\n"
+    "      Move it aside before running the pipeline, e.g.:\n"
+    "          Rename-Item data data_old_synthetic      (PowerShell)\n"
+    "          mv data data_old_synthetic               (bash)\n"
+    "      otherwise the old and new households are counted together."
+)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--days", type=int, default=180, help="history length")
@@ -570,6 +584,10 @@ def main() -> None:
 
     url = os.getenv("SYNTHETIC_DATABASE_URL")
     assert_safe_target(url)
+    # Second, independent check: ask the DATABASE itself who it is.
+    ok, message = check_environment(url, "synthetic")
+    if not ok:
+        sys.exit(f"Refusing to run: {message}")
     target = make_url(url)
     print(f"\nWriting to host={target.host} database={target.database} ...")
 
@@ -585,6 +603,8 @@ def main() -> None:
     args.truth_path.write_text(json.dumps(truth, indent=2), encoding="utf-8")
     print(f"Done. Answer key saved to {args.truth_path}")
     print(f"Scopes: {', '.join(scope_keys.values())}")
+    print()
+    print(CLEAN_START_HINT)
 
 
 if __name__ == "__main__":

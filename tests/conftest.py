@@ -7,6 +7,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
+from backend.app.core.db_safety import check_environment
+
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
@@ -35,6 +37,14 @@ def test_engine():
 
     if url.get_backend_name() != "postgresql":
         pytest.fail("Model tests require PostgreSQL.")
+
+    # Second, stronger guard: ask the DATABASE itself who it is. A wrong URL
+    # (for example production pasted into TEST_DATABASE_URL) is caught here
+    # even when no other URL happens to match it. An unmarked database on this
+    # computer (CI, local docker) is accepted; see backend/app/core/db_safety.py.
+    ok, message = check_environment(database_url, "test")
+    if not ok:
+        pytest.fail(f"Refusing to run tests: {message}")
 
     engine = create_engine(
         database_url,
