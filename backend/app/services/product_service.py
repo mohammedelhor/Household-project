@@ -2,7 +2,7 @@
 import re
 import unicodedata
 
-from sqlalchemy import select
+from sqlalchemy import select, case
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from backend.app.core.units import normalize_unit
@@ -105,3 +105,41 @@ def get_product_by_name(db: Session, name: str) -> Product | None:
             Product.normalized_name == normalized_name
         )
     )
+def search_products(
+    db: Session,
+    search: str | None = None,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[Product]:
+    """Active products, optionally filtered by a piece of the name.
+
+    WHY ON `normalized_name`: that column is what makes two spellings the
+    same product ("  Milk" / "milk"), and the unique constraint is on it. The
+    search text goes through the SAME normalization, so the catalog and the
+    search always agree on what "the same" means.
+
+    ORDER: names that START with the text come first ("mil" -> "milk" before
+    "buttermilk"), then alphabetical, then id so the order is stable and
+    paging never skips or repeats a row.
+
+    `autoescape=True` makes %, _ and \\ in the user's text plain characters,
+    not wildcards (otherwise searching "%" would list the whole catalog).
+    Raises ValueError when the text normalizes to nothing (only spaces).
+    """
+
+    statement = select(Product).where(Product.is_active.is_(True))
+
+    if search is not None:
+        term = normalize_product_name(search)
+        starts_with = Product.normalized_name.startswith(term, autoescape=True)
+        statement = statement.where(
+            Product.normalized_name.contains(term, autoescape=True)
+        ).order_by(case((starts_with, 0), else_=1))
+
+    statement = (
+        statement.order_by(Product.normalized_name, Product.id)
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(db.scalars(statement).all())

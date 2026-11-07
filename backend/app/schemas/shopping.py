@@ -26,7 +26,21 @@ class ShoppingListRead(BaseModel):
 
     id: int
     name: str
+class ShoppingListSummary(BaseModel):
+    """One list in "my lists": enough for a screen to show it, open it and
+    decide which buttons to offer.
 
+    `scope_type` / `scope_id` use the same vocabulary as /suggestions
+    ("user" or "household"), so a client can match a suggestion to its list.
+    `can_manage` answers "may I create/archive this list?": always true for
+    a personal list, true for a household list only for its owner and admins.
+    """
+
+    id: int
+    name: str
+    scope_type: Literal["user", "household"]
+    scope_id: int
+    can_manage: bool
 
 
 class ShoppingListItemCreate(BaseModel):

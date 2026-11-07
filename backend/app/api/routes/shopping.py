@@ -16,6 +16,7 @@ from backend.app.db.models import (
 )
 from backend.app.schemas.shopping import (
     ShoppingListCreate,
+    ShoppingListSummary,
     ShoppingListRead,
     ShoppingListItemCreate,
     ShoppingListItemRead,
@@ -206,7 +207,67 @@ def create_household_list(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         )
+@router.get(
+    "/shopping-lists",
+    response_model=list[ShoppingListSummary],
+)
+def read_my_shopping_lists(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ShoppingListSummary]:
+    """The active lists this user can open: their personal list and the
+    list of the household they belong to.
 
+    The database allows at most ONE active personal list per user and ONE
+    active list per household, and a user belongs to at most one household,
+    so this returns at most two rows: no pagination is needed.
+    """
+
+    # household_id -> my role there (at most one row, see the note above).
+    roles = dict(
+        db.execute(
+            select(HouseholdMember.household_id, HouseholdMember.role).where(
+                HouseholdMember.user_id == current_user.id
+            )
+        ).all()
+    )
+
+    shopping_lists = db.scalars(
+        select(ShoppingList)
+        .where(
+            ShoppingList.archived_at.is_(None),
+            or_(
+                ShoppingList.owner_user_id == current_user.id,
+                ShoppingList.household_id.in_(list(roles)),
+            ),
+        )
+        .order_by(ShoppingList.id)
+    ).all()
+
+    summaries = []
+    for shopping_list in shopping_lists:
+        if shopping_list.household_id is None:
+            summaries.append(
+                ShoppingListSummary(
+                    id=shopping_list.id,
+                    name=shopping_list.name,
+                    scope_type="user",
+                    scope_id=current_user.id,
+                    can_manage=True,  # it is my own list
+                )
+            )
+        else:
+            summaries.append(
+                ShoppingListSummary(
+                    id=shopping_list.id,
+                    name=shopping_list.name,
+                    scope_type="household",
+                    scope_id=shopping_list.household_id,
+                    # Same rule as creating/archiving a household list below.
+                    can_manage=roles[shopping_list.household_id] in ("owner", "admin"),
+                )
+            )
+    return summaries
 
 @router.get(
     "/shopping-lists/{list_id}",
